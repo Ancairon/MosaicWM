@@ -88,13 +88,18 @@ export const DragHandler = GObject.registerClass({
         }
 
         this._currentGrabOp = grabpo;
-        if (isResizeGrabOp(grabpo)) {
+        const isResizeOp = isResizeGrabOp(grabpo);
+        const isMoveOp = isMoveGrabOp(grabpo);
+        Logger.log(`[GRAB BEGIN] window=${window.get_id()} grabOp=${grabpo} isResize=${isResizeOp} isMove=${isMoveOp} isKeyboardMoving=${grabpo === Meta.GrabOp.KEYBOARD_MOVING}`);
+        if (isResizeOp) {
+            Logger.log(`[GRAB BEGIN] resize path selected for window ${window.get_id()}`);
             this._ext.resizeHandler.onResizeBegin(window, grabpo);
+            return;
         }
 
         // A window leaving an edge tile takes its own drag path; when that path owns the
         // grab it has already wired everything up, so the reorder blocks below must not run.
-        if (isMoveGrabOp(grabpo) && !this.windowingManager.isExcluded(window)) {
+        if (isMoveOp && !this.windowingManager.isExcluded(window)) {
             if (this._beginEdgeTileDrag(window, grabpo)) return;
         }
 
@@ -221,6 +226,9 @@ export const DragHandler = GObject.registerClass({
 
     _grabOpEndHandler = (_display, window, grabpo) => {
         this._currentGrabOp = null;
+        const isResizeEnd = isResizeGrabOp(grabpo);
+        const isMoveEnd = isMoveGrabOp(grabpo);
+        Logger.log(`[GRAB END] window=${window.get_id()} grabOp=${grabpo} isResize=${isResizeEnd} isMove=${isMoveEnd} isKeyboardMoving=${grabpo === Meta.GrabOp.KEYBOARD_MOVING}`);
         // Unconditional: a leftover id would freeze that window out of every later layout.
         this.tilingManager.setGrabbedWindow(null);
 

@@ -21,5 +21,8 @@ export function isResizeGrabOp(grabOp) {
 
 // A window grab op with no directional bits set is a move (Mutter convention).
 export function isMoveGrabOp(grabOp) {
+    // Keyboard resize grab ops can carry the generic window-grab bit and must
+    // never enter drag/reorder handling.
+    if (isResizeGrabOp(grabOp)) return false;
     return (grabOp & 0x1) !== 0 && (grabOp & 0xF000) === 0;
 }

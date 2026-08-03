@@ -106,11 +106,14 @@ export const AnimationsManager = GObject.registerClass({
         this._isDragging = dragging;
     }
 
-    shouldAnimateWindow(window, draggedWindow = null) {
+    shouldAnimateWindow(window, draggedWindow = null, allowDuringResize = false) {
         if (!getAnimationsEnabled()) return false;
         if (Main.overview.visible) return false;
-        // During active resize, position all sibling windows instantly (real-time retile)
+        // During active resize, position all sibling windows instantly (real-time retile).
+        // The actively resized window itself may still animate when explicitly allowed.
         if (this._resizingWindowId !== null) {
+            if (allowDuringResize && this._resizingWindowId === window.get_id())
+                return true;
             // A leaked id here would quietly stop every window animating, so log it
             Logger.log(`[ANIM-DIAG] shouldAnimate ${window.get_id()}: no ease (resizingWindowId=${this._resizingWindowId})`);
             return false;
@@ -133,15 +136,16 @@ export const AnimationsManager = GObject.registerClass({
             userOp = false,
             firstPlacement = false,
             slideInOffset = null,
+            allowDuringResize = false,
         } = options;
-        return { duration, mode, onComplete, draggedWindow, subtle, userOp, firstPlacement, slideInOffset };
+        return { duration, mode, onComplete, draggedWindow, subtle, userOp, firstPlacement, slideInOffset, allowDuringResize };
     }
 
     animateWindow(window, targetRect, options = {}) {
-        const { duration, mode, onComplete, draggedWindow, subtle, userOp, firstPlacement, slideInOffset } =
+        const { duration, mode, onComplete, draggedWindow, subtle, userOp, firstPlacement, slideInOffset, allowDuringResize } =
             this._animOptions(options);
 
-        if (!this.shouldAnimateWindow(window, draggedWindow)) {
+        if (!this.shouldAnimateWindow(window, draggedWindow, allowDuringResize)) {
             this._applyWithoutAnimation(window, targetRect, { userOp, firstPlacement, onComplete });
             return;
         }

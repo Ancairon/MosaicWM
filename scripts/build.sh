@@ -7,6 +7,21 @@ UUID="mosaicwm@cleomenezesjr.github.io"
 SRCDIR="extension"
 ZIPFILE="$UUID.zip"
 
+is_enabled() {
+    gnome-extensions info "$UUID" 2>/dev/null | grep -q '^  Enabled: Yes$'
+}
+
+reload_extension() {
+    if ! is_enabled; then
+        echo "Extension is not enabled; skipping in-session reload."
+        return 0
+    fi
+
+    echo "Reloading active extension in-session..."
+    gnome-extensions disable "$UUID"
+    gnome-extensions enable "$UUID"
+}
+
 usage() {
     echo "Usage: $0 [OPTION]"
     echo ""
@@ -29,19 +44,30 @@ build() {
 
 install() {
     echo "Installing Mosaic WM..."
-    
+
+    local was_enabled=false
+    if is_enabled; then
+        was_enabled=true
+    fi
+
     # Build first
     build
-    
+
     # Install using gnome-extensions
     gnome-extensions install --force "$ZIPFILE"
-    
+
     # Clean up
     rm -f "$ZIPFILE"
-    
+
+    if [ "$was_enabled" = true ]; then
+        reload_extension
+    else
+        echo "Extension is installed but currently disabled."
+        echo "Enable it with: gnome-extensions enable $UUID"
+    fi
+
     echo "Installation complete!"
-    echo "Please restart GNOME Shell (log out and log back in)"
-    echo "Then enable: gnome-extensions enable $UUID"
+    echo "If the current GNOME Shell session still shows stale behavior, log out and log back in as a fallback."
 }
 
 uninstall() {

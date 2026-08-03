@@ -604,6 +604,7 @@ export default class WindowMosaicExtension extends Extension {
     // their default combo, so a user who rebound them keeps their choice.
     _overrideConflictingKeybindings() {
         const mutterKeybindings = new Gio.Settings({ schema_id: 'org.gnome.mutter.keybindings' });
+        const desktopWmKeybindings = new Gio.Settings({ schema_id: 'org.gnome.desktop.wm.keybindings' });
         const emptyArray = new GLib.Variant('as', []);
 
         if (mutterKeybindings.get_strv('toggle-tiled-left').includes('<Super>Left')) {
@@ -611,6 +612,12 @@ export default class WindowMosaicExtension extends Extension {
         }
         if (mutterKeybindings.get_strv('toggle-tiled-right').includes('<Super>Right')) {
             this._settingsOverrider.add(mutterKeybindings, 'toggle-tiled-right', emptyArray);
+        }
+        if (desktopWmKeybindings.get_strv('maximize').includes('<Super>Up')) {
+            this._settingsOverrider.add(desktopWmKeybindings, 'maximize', emptyArray);
+        }
+        if (desktopWmKeybindings.get_strv('unmaximize').includes('<Super>Down')) {
+            this._settingsOverrider.add(desktopWmKeybindings, 'unmaximize', emptyArray);
         }
 
         const shellKeybindings = new Gio.Settings({ schema_id: 'org.gnome.shell.keybindings' });
@@ -891,8 +898,193 @@ export default class WindowMosaicExtension extends Extension {
         Main.wm.addKeybinding('swap-down', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
             () => this._swapActiveWindow('down'));
 
+        Main.wm.addKeybinding('resize-left-edge', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this._resizeActiveWindowEdge('left'));
+
+        Main.wm.addKeybinding('resize-right-edge', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this._resizeActiveWindowEdge('right'));
+
+        Main.wm.addKeybinding('resize-top-edge', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this._resizeActiveWindowEdge('top'));
+
+        Main.wm.addKeybinding('resize-bottom-edge', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this._resizeActiveWindowEdge('bottom'));
+
         Logger.log('All swap keybindings registered successfully');
         Logger.log('Keyboard shortcuts registered');
+    }
+
+    _resizeActiveWindowEdge(edge) {
+        const ctx = this._resolveKeyboardResizeTarget(edge);
+        if (!ctx) return;
+
+        const { window, frame, nextX, nextY, nextWidth, nextHeight } = ctx;
+        if (nextX === frame.x && nextY === frame.y &&
+            nextWidth === frame.width && nextHeight === frame.height) {
+            Logger.log(`Keyboard edge resize ${edge} for ${window.get_id()} hit clamp, skipping`);
+            return;
+        }
+
+        this._commitKeyboardResize(window, { x: nextX, y: nextY, width: nextWidth, height: nextHeight });
+    }
+
+    // Validates the active window and computes its next edge-cycled geometry, or null
+    // if the shortcut doesn't apply (no window, excluded, no room to resize, etc).
+    _resolveKeyboardResizeTarget(edge) {
+        const window = this._getResizableActiveWindow();
+        if (!window) return null;
+
+        const workArea = this._resolveKeyboardResizeWorkArea(window, edge);
+        if (!workArea) return null;
+
+        const minSize = this.tilingManager.getWindowMinimumSize(window);
+        const frame = window.get_frame_rect();
+        const geometry = this._computeKeyboardResizeGeometry(edge, frame, workArea, minSize);
+        if (!geometry) return null;
+
+        return { window, frame, ...geometry };
+    }
+
+    // The focused window, unless it can't take a keyboard-driven edge resize right now.
+    _getResizableActiveWindow() {
+        const window = global.display.focus_window;
+        if (!window) {
+            Logger.log('No active window to resize');
+            return null;
+        }
+
+        if (this.windowingManager.isExcluded(window)) {
+            Logger.log('Window is excluded from tiling');
+            return null;
+        }
+
+        if (window.allows_resize && !window.allows_resize()) {
+            Logger.log(`Window ${window.get_id()} does not allow resize`);
+            return null;
+        }
+
+        return window;
+    }
+
+    _resolveKeyboardResizeWorkArea(window, edge) {
+        const workspace = window.get_workspace();
+        const monitor = window.get_monitor();
+        if (!workspace || monitor === null || monitor === undefined) {
+            Logger.log(`Window ${window.get_id()} has no workspace/monitor for keyboard resize`);
+            return null;
+        }
+
+        const isEdgeTiled = this.edgeTilingManager.isEdgeTiled(window);
+        const workArea = isEdgeTiled
+            ? workspace.get_work_area_for_monitor(monitor)
+            : this.tilingManager.getUsableWorkArea(workspace, monitor);
+        if (!workArea || workArea.width <= 0 || workArea.height <= 0) {
+            Logger.log(`Keyboard edge resize ${edge} for ${window.get_id()} has no usable work area`);
+            return null;
+        }
+
+        return workArea;
+    }
+
+    // Cycles the requested edge through the RESIZE_CYCLE_FRACTIONS presets, wrapping at
+    // both ends, and keeps the window centered on its current position along that axis.
+    _computeKeyboardResizeGeometry(edge, frame, workArea, minSize) {
+        const clampMargin = constants.WINDOW_SPACING / 2;
+        const getCycleSteps = (dimension, minimum) => {
+            const usableDimension = Math.max(0, dimension - constants.WINDOW_SPACING);
+            return constants.RESIZE_CYCLE_FRACTIONS
+                .map(fraction => Math.round(fraction * usableDimension))
+                .filter(size => size >= minimum);
+        };
+        const getWrappedStep = (steps, currentSize, direction) => {
+            if (steps.length === 0)
+                return undefined;
+
+            if (direction > 0)
+                return steps.find(size => size > currentSize + clampMargin) ?? steps[0];
+
+            return [...steps].reverse().find(size => size < currentSize - clampMargin) ?? steps.at(-1);
+        };
+
+        let nextX = frame.x;
+        let nextY = frame.y;
+        let nextWidth = frame.width;
+        let nextHeight = frame.height;
+
+        switch (edge) {
+            case 'left': {
+                const steps = getCycleSteps(workArea.width, minSize.width);
+                const newWidth = getWrappedStep(steps, frame.width, -1);
+                if (newWidth === undefined) return null;
+                const centerX = frame.x + frame.width / 2;
+                nextX = Math.round(Math.max(workArea.x + clampMargin,
+                    Math.min(workArea.x + workArea.width - clampMargin - newWidth, centerX - newWidth / 2)));
+                nextWidth = newWidth;
+                break;
+            }
+            case 'right': {
+                const steps = getCycleSteps(workArea.width, minSize.width);
+                const newWidth = getWrappedStep(steps, frame.width, 1);
+                if (newWidth === undefined) return null;
+                const centerX = frame.x + frame.width / 2;
+                nextX = Math.round(Math.max(workArea.x + clampMargin,
+                    Math.min(workArea.x + workArea.width - clampMargin - newWidth, centerX - newWidth / 2)));
+                nextWidth = newWidth;
+                break;
+            }
+            case 'top': {
+                const steps = getCycleSteps(workArea.height, minSize.height);
+                const newHeight = getWrappedStep(steps, frame.height, 1);
+                if (newHeight === undefined) return null;
+                const centerY = frame.y + frame.height / 2;
+                nextY = Math.round(Math.max(workArea.y + clampMargin,
+                    Math.min(workArea.y + workArea.height - clampMargin - newHeight, centerY - newHeight / 2)));
+                nextHeight = newHeight;
+                break;
+            }
+            case 'bottom': {
+                const steps = getCycleSteps(workArea.height, minSize.height);
+                const newHeight = getWrappedStep(steps, frame.height, -1);
+                if (newHeight === undefined) return null;
+                const centerY = frame.y + frame.height / 2;
+                nextY = Math.round(Math.max(workArea.y + clampMargin,
+                    Math.min(workArea.y + workArea.height - clampMargin - newHeight, centerY - newHeight / 2)));
+                nextHeight = newHeight;
+                break;
+            }
+            default:
+                return null;
+        }
+
+        nextWidth = Math.max(nextWidth, minSize.width);
+        nextHeight = Math.max(nextHeight, minSize.height);
+
+        return { nextX, nextY, nextWidth, nextHeight };
+    }
+
+    _commitKeyboardResize(window, target) {
+        const resizeTimeoutId = WindowState.get(window, 'keyboardResizeTimeoutId');
+        if (!resizeTimeoutId) {
+            this.resizeHandler.onResizeBegin(window, null);
+        } else if (this._timeoutRegistry) {
+            this._timeoutRegistry.remove(resizeTimeoutId);
+        }
+
+        WindowState.set(window, 'isConstrainedByMosaic', false);
+        if (this.animationsManager) {
+            this.animationsManager.animateWindow(window, target, { subtle: true, userOp: true, allowDuringResize: true });
+        } else {
+            window.move_resize_frame(true, target.x, target.y, target.width, target.height);
+        }
+
+        const timeoutId = this._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
+            WindowState.remove(window, 'keyboardResizeTimeoutId');
+            if (isWindowAlive(window) && window.get_workspace()) {
+                this.resizeHandler.onResizeEnd(window, null, false);
+            }
+            return GLib.SOURCE_REMOVE;
+        }, 'extension_keyboardEdgeResizeCommit');
+        WindowState.set(window, 'keyboardResizeTimeoutId', timeoutId);
     }
 
     _tileActiveWindow(zone) {
@@ -921,22 +1113,18 @@ export default class WindowMosaicExtension extends Extension {
     }
 
     _swapActiveWindow(direction) {
-        Logger.log(`*** SWAP SHORTCUT TRIGGERED *** Direction: ${direction}`);
         const focusedWindow = global.display.get_focus_window();
 
         if (!focusedWindow) {
-            Logger.log('SWAP FAILED: No focused window');
             return;
         }
 
         if (this.windowingManager.isExcluded(focusedWindow)) {
-            Logger.log(`SWAP FAILED: Window ${focusedWindow.get_id()} is excluded`);
             return;
         }
 
-        Logger.log(`SWAP: Calling swapping.swapWindow for window ${focusedWindow.get_id()} direction: ${direction}`);
-        this.swappingManager.swapWindow(focusedWindow, direction);
-        Logger.log('SWAP: swapWindow call completed');
+        Logger.log(`Keyboard shortcut: moving window ${focusedWindow.get_id()} in grid direction ${direction}`);
+        this.swappingManager.moveWindowInGrid(focusedWindow, direction);
     }
 
     // Phases run in the same order the old flat method did; teardown order is load-bearing
@@ -995,6 +1183,10 @@ export default class WindowMosaicExtension extends Extension {
         Main.wm.removeKeybinding('swap-right');
         Main.wm.removeKeybinding('swap-up');
         Main.wm.removeKeybinding('swap-down');
+        Main.wm.removeKeybinding('resize-left-edge');
+        Main.wm.removeKeybinding('resize-right-edge');
+        Main.wm.removeKeybinding('resize-top-edge');
+        Main.wm.removeKeybinding('resize-bottom-edge');
         Logger.log('Keyboard shortcuts removed');
     }
 

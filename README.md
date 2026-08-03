@@ -32,9 +32,11 @@ The consistent principle behind both: nothing should require the user to think a
 - Automatic mosaic layout using a radial packing algorithm
 - Miniature thumbnails when a workspace runs out of room, in most-recently-used order; click one to restore it
 - Overflow to another workspace for windows that cannot shrink any further
-- Edge tiling to halves and quarters by dragging to a screen edge, with the remaining windows adapting to what is left
-- Window swapping by dragging one window onto another, or by keyboard shortcut
-- Dedicated workspaces for maximized and fullscreen windows
+- Edge tiling to halves and quarters by dragging to a screen edge, with consistent half-spacing screen margins and the remaining windows adapting to what is left
+- Window swapping by dragging one window onto another
+- Move the focused window around the mosaic grid with `Super+Left/Right/Up/Down`
+- Cycle the focused window's width/height through 5% presets with `Super+W/A/S/D`, wrapping at both ends
+- Fullscreen and maximized windows stay on their current workspace instead of being isolated to a dedicated one; in the Overview they are kept behind the other Mosaic thumbnails
 - Windows grow back toward their preferred size when neighbours close or miniaturize
 - Quick Settings toggles for mosaic per workspace and globally, with a top bar indicator
 - Miniatures keep their scale and position across the Overview
@@ -65,24 +67,29 @@ cd MosaicWM
 ./scripts/build.sh -i
 ```
 
-Then log out, log back in, and enable it:
+The install script reloads the extension in-session when it is already enabled.
+If your current GNOME Shell session still shows stale behavior after install, log out and log back in as a fallback.
 
-```bash
-gnome-extensions enable mosaicwm@cleomenezesjr.github.io
-```
+### Manual Installation
 
-For everyday use rather than development, set `const DEBUG = false;` in `extension/logger.js` before installing. It defaults to `true`, which logs verbosely and costs CPU.
+1. Download the latest release from GitHub
+2. Extract to `~/.local/share/gnome-shell/extensions/mosaicwm@cleomenezesjr.github.io/`
+3. **Disable debug logging**: Edit `extension/logger.js` and set `const DEBUG = false;`
+4. Enable via Extensions app or: `gnome-extensions enable mosaicwm@cleomenezesjr.github.io`
+5. If the current session still shows stale behavior, restart GNOME Shell by logging out and back in
 
 ## Usage
 
 There is nothing to configure. Once enabled:
 
-- Opening a window tiles it into the mosaic.
-- Dragging a window reorders it, or tiles it to a half or quarter if you drag to an edge.
-- Dragging a window onto another swaps the two.
-- Maximizing or going fullscreen moves the window to its own workspace.
-- Minimizing takes a window out of the mosaic.
-- When the workspace is full, the least recently used window becomes a thumbnail. Click it to bring it back.
+- **Open windows**: They'll be automatically tiled
+- **Drag windows**: Click and drag to reorder, or to a screen edge for half/quarter tiling
+- **Swap windows**: Drag a window onto another to swap their positions
+- **Grid movement**: `Super+Left`, `Super+Right`, `Super+Up`, and `Super+Down` move the focused window toward the neighboring grid slot when one exists
+- **Keyboard resize**: `Super+D` cycles width up, `Super+A` cycles width down, `Super+W` cycles height up, and `Super+S` cycles height down through 5% presets from 5% to 100% of the usable tiling area, wrapping at both ends
+- **Maximize/Fullscreen**: Window stays on its current workspace; in Overview it is kept behind the other Mosaic thumbnails
+- **Minimize**: Window is excluded from tiling
+- **Too many windows**: Extra windows shrink into small thumbnails. Click one to bring it back to focus
 
 ## Development
 
@@ -91,16 +98,24 @@ npm install            # the pre-commit hook shells out to npx eslint
 ./scripts/setup-hooks  # symlinks .git/hooks/pre-commit, per clone
 ```
 
-`setup-hooks` has to be run by hand after cloning: git hooks live outside the working tree and are not cloned. The hook only runs ESLint over staged files, while CI runs ESLint over all of `extension/`, plus `shexli` and a build. Passing the hook does not mean CI will pass; CI is the real gate.
+`./scripts/build.sh -i` reloads the extension in-session when it is already enabled. Use a full log out/log back in only if the running shell still keeps stale code after reinstall.
 
-```bash
-./scripts/build.sh -b        # build only
-./scripts/build.sh -i        # build and install
-./scripts/run-gnome-shell.sh # nested GNOME Shell session for testing
-npm run lint
+### Enable Debug Logging
+
+Debug logging is enabled by default for development. To enable verbose debug logs, edit `extension/logger.js` and set:
+
+```javascript
+const DEBUG = true;
 ```
 
-Keep `DEBUG = true` in `extension/logger.js` while developing. Logs go to the journal:
+> [!TIP]
+> For production/installation, set `DEBUG = false` to reduce CPU usage.
+
+### Debugging
+
+For debugging and development tips, see the [GJS Extension Development Guide](https://gjs.guide/extensions/development/debugging.html).
+
+View logs in real-time:
 
 ```bash
 journalctl -f -o cat /usr/bin/gnome-shell | grep -i mosaic

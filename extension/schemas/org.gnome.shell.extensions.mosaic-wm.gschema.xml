@@ -2,14 +2,14 @@
 <schemalist>
   <schema id="org.gnome.shell.extensions.mosaic-wm" path="/org/gnome/shell/extensions/mosaic-wm/">
     <key name="tile-left" type="as">
-      <default>['&lt;Super&gt;Left']</default>
+      <default>[]</default>
       <summary>Tile window to left</summary>
-      <description>Tile the active window to the left half of the screen</description>
+      <description>Tile the active window to the left half of the screen. Unbound by default.</description>
     </key>
     <key name="tile-right" type="as">
-      <default>['&lt;Super&gt;Right']</default>
+      <default>[]</default>
       <summary>Tile window to right</summary>
-      <description>Tile the active window to the right half of the screen</description>
+      <description>Tile the active window to the right half of the screen. Unbound by default.</description>
     </key>
     <key name="tile-top-left" type="as">
       <default>['&lt;Super&gt;&lt;Ctrl&gt;Left']</default>
@@ -32,24 +32,44 @@
       <description>Tile the active window to the bottom-right quarter of the screen</description>
     </key>
     <key name="swap-left" type="as">
-      <default>['&lt;Super&gt;&lt;Alt&gt;Left']</default>
+      <default>['&lt;Super&gt;Left']</default>
       <summary>Swap window to the left</summary>
       <description>Swap the active window with its left neighbor (mosaic or tiling)</description>
     </key>
     <key name="swap-right" type="as">
-      <default>['&lt;Super&gt;&lt;Alt&gt;Right']</default>
+      <default>['&lt;Super&gt;Right']</default>
       <summary>Swap window to the right</summary>
       <description>Swap the active window with its right neighbor (mosaic or tiling)</description>
     </key>
     <key name="swap-up" type="as">
-      <default>['&lt;Super&gt;&lt;Alt&gt;Up']</default>
+      <default>['&lt;Super&gt;Up']</default>
       <summary>Swap window upward</summary>
-      <description>Swap the active window with its upper neighbor (quarter tiles only)</description>
+      <description>Swap the active window with its upper neighbor in the mosaic grid, or the upper quarter-tile neighbor when edge-tiling applies</description>
     </key>
     <key name="swap-down" type="as">
-      <default>['&lt;Super&gt;&lt;Alt&gt;Down']</default>
+      <default>['&lt;Super&gt;Down']</default>
       <summary>Swap window downward</summary>
-      <description>Swap the active window with its lower neighbor (quarter tiles only)</description>
+      <description>Swap the active window with its lower neighbor in the mosaic grid, or the lower quarter-tile neighbor when edge-tiling applies</description>
+    </key>
+    <key name="resize-left-edge" type="as">
+      <default>['&lt;Super&gt;a']</default>
+      <summary>Cycle window width down</summary>
+      <description>Snap the active window's width to the next smaller 5% preset (5 through 100 % of usable tiling width), keeping it centered and wrapping at the smallest step</description>
+    </key>
+    <key name="resize-right-edge" type="as">
+      <default>['&lt;Super&gt;d']</default>
+      <summary>Cycle window width up</summary>
+      <description>Snap the active window's width to the next larger 5% preset (5 through 100 % of usable tiling width), keeping it centered and wrapping at the largest step</description>
+    </key>
+    <key name="resize-top-edge" type="as">
+      <default>['&lt;Super&gt;w']</default>
+      <summary>Cycle window height up</summary>
+      <description>Snap the active window's height to the next larger 5% preset (5 through 100 % of usable tiling height), keeping it centered and wrapping at the largest step</description>
+    </key>
+    <key name="resize-bottom-edge" type="as">
+      <default>['&lt;Super&gt;s']</default>
+      <summary>Cycle window height down</summary>
+      <description>Snap the active window's height to the next smaller 5% preset (5 through 100 % of usable tiling height), keeping it centered and wrapping at the smallest step</description>
     </key>
   </schema>
 </schemalist>

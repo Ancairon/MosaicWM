@@ -484,9 +484,6 @@ export const TilingManager = GObject.registerClass({
 
         for (const pos of positions) {
             if (this.masks.has(pos.id)) {
-                if (this._drawingManager) {
-                    this._drawingManager.rect(pos.x, pos.y, pos.width, pos.height);
-                }
                 continue;
             }
 
@@ -522,8 +519,17 @@ export const TilingManager = GObject.registerClass({
         if (!posChanged && !sizeChanged) return;
 
         WindowState.set(window, 'isConstrainedByMosaic', true);
-        // Same actor-measured continuity as WindowDescriptor.draw: start the ease from
-        // where the window really is, and end it where mutter really put it.
+        if (this._animationsManager) {
+            this._animationsManager.animateWindow(window, pos, { subtle: true });
+            return;
+        }
+
+        this._applyDragLayoutWindowManualEase(window, pos, currentRect);
+    }
+
+    // Same actor-measured continuity as WindowDescriptor.draw: start the ease from
+    // where the window really is, and end it where mutter really put it.
+    _applyDragLayoutWindowManualEase(window, pos, currentRect) {
         const actor = window.get_compositor_private();
         const alive = actor && !actor.is_destroyed();
         const visualX = alive ? actor.x + actor.translation_x : 0;
@@ -1585,7 +1591,10 @@ export const TilingManager = GObject.registerClass({
         if(current_monitor === undefined)
             current_monitor = window.get_monitor();
 
-        const meta_windows = this._eligibleTileWindows(workspace, current_monitor, window, excludeFromTiling);
+        // Sacred isolation disabled: filter maximized/fullscreen windows before computing swap lists.
+        // Tiling runs on their non-maximized siblings; the maximized window is left untouched visually.
+        const meta_windows = this._eligibleTileWindows(workspace, current_monitor, window, excludeFromTiling)
+            .filter(w => !this._windowingManager.isMaximizedOrFullscreen(w));
 
         let edgeTiledWindows = [];
         if (this._edgeTilingManager) {
@@ -1596,11 +1605,6 @@ export const TilingManager = GObject.registerClass({
         const nonEdgeTiledMetaWindows = meta_windows.filter(w => !edgeTiledIds.includes(w.get_id()));
 
         const windowsForSwaps = edgeTiledWindows.length > 0 ? nonEdgeTiledMetaWindows : meta_windows;
-
-        for (const win of meta_windows) {
-            if (this._windowingManager.isMaximizedOrFullscreen(win))
-                return false;
-        }
 
         const _windows = this.windowsToDescriptors(windowsForSwaps, current_monitor, window);
 
@@ -1892,47 +1896,18 @@ export const TilingManager = GObject.registerClass({
         // Only overflow a window whose arrival is still being placed; this prevents expelling
         // existing windows during resize retiling.
         const isNewlyAdded = this._isArrivalPending(reference_meta_window);
-        if (!isNewlyAdded && !WindowState.get(reference_meta_window, 'forceOverflow') && !WindowState.get(reference_meta_window, 'isRestoringSacred')) {
+        if (!isNewlyAdded && !WindowState.get(reference_meta_window, 'forceOverflow')) {
             Logger.log(`Skipping overflow for ${reference_meta_window.get_id()} - not a new window`);
             return { tile_info, referenceOverflowSkipped: true };
         }
 
-        if (WindowState.get(reference_meta_window, 'isSmartResizing') || WindowState.get(reference_meta_window, 'isRestoringSacred')) {
-            Logger.log(`Skipping overflow for ${reference_meta_window.get_id()} - smart resize/sacred restore in progress`);
-            // A sacred return must be made to fit even if it squishes everyone; only try once
-            // (guarded by isSmartResizing) to avoid loops.
-            if (WindowState.get(reference_meta_window, 'isRestoringSacred') && !WindowState.get(reference_meta_window, 'isSmartResizing')) {
-                return this._fitReturningSacred(reference_meta_window, workspace, monitor);
-            }
+        if (WindowState.get(reference_meta_window, 'isSmartResizing')) {
+            Logger.log(`Skipping overflow for ${reference_meta_window.get_id()} - smart resize in progress`);
             return { tile_info, referenceOverflowSkipped: false };
         }
 
         this._expelReferenceWindow(reference_meta_window, windows);
         return { tile_info: this._tile(windows, tileArea), referenceOverflowSkipped: false };
-    }
-
-    _fitReturningSacred(reference_meta_window, workspace, monitor) {
-        Logger.log('Triggering Smart Resize for returning sacred window');
-        const workArea = this.getUsableWorkArea(workspace, monitor);
-        // windows above are descriptors; re-fetch MetaWindows for tryFitWithResize.
-        const realExisting = this._windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w => w.get_id() !== reference_meta_window.get_id() && !this._windowingManager.isExcluded(w));
-
-        const resizeResult = this.tryFitWithResize(reference_meta_window, realExisting, workArea, workspace);
-        if (!resizeResult?.success) {
-            Logger.log('Smart resize could not fit sacred window');
-            this._positionSnapshot = null;
-            this._restoreAnchor = null;
-            this._unlockWorkspaceEarlyReturn(workspace);
-            return { stop: true };
-        }
-
-        // Preserve any pending miniatures discovered during this resize pass.
-        if (resizeResult.pendingWindows?.length > 0) {
-            this._pendingMiniatureWindows = resizeResult.pendingWindows;
-        }
-        // Use the tile_info from tryFitWithResize (computed with miniature sizes).
-        return { tile_info: resizeResult.tileInfo, referenceOverflowSkipped: false };
     }
 
     _expelReferenceWindow(reference_meta_window, windows) {
@@ -1944,6 +1919,7 @@ export const TilingManager = GObject.registerClass({
                 break;
             }
         }
+        Logger.log(`[OVERFLOW PATH] reference overflow for window ${reference_meta_window.get_id()} isDragging=${this.isDragging}`);
         this._windowingManager.moveOversizedWindow(reference_meta_window).catch(e =>
             Logger.error(`Overflow move failed for ref window: ${e}`));
     }
@@ -2178,6 +2154,11 @@ export const TilingManager = GObject.registerClass({
         const monitor = working_info.monitor;
 
         const workspace_windows = this._windowingManager.getMonitorWorkspaceWindows(workspace, monitor);
+        if (workspace_windows.some(w => this._windowingManager.isMaximizedOrFullscreen(w))) {
+            Logger.log(`tileWorkspaceWindows: Sacred window present on workspace ${workspace.index()} monitor ${monitor} - preserving existing layout cache`);
+            this._unlockWorkspaceEarlyReturn(workspace);
+            return { done: true, result: { overflow: false, layout: null } };
+        }
 
         let edgeTiledWindows = [];
         if (this._edgeTilingManager) {
@@ -2460,16 +2441,16 @@ export const TilingManager = GObject.registerClass({
             return true;
         }
 
-        const verdict = this._sacredIsolationVerdict(window, workspace, monitor);
-        if (verdict !== 'continue') return verdict === 'fits';
+        // Sacred isolation disabled: maximized/fullscreen windows coexist with siblings.
+        // _getWorkingInfo filters them from the layout, so they don't block fit checks.
+        if (this._windowingManager.isMaximizedOrFullscreen(window)) {
+            Logger.log('canFitWindow: Window is sacred - fits (isolation disabled, not resized by tiling)');
+            return true;
+        }
 
         const working_info = this._getWorkingInfo(workspace, window, monitor);
         if (!working_info) {
             Logger.log('canFitWindow: No working info - cannot fit');
-            return false;
-        }
-        if (this._hasMaximizedWindow(working_info.meta_windows)) {
-            Logger.log('canFitWindow: Workspace has maximized window - cannot fit');
             return false;
         }
 
@@ -2492,32 +2473,6 @@ export const TilingManager = GObject.registerClass({
         } else {
             this._appendNewWindowDescriptor(window, windows, overrideSize);
         }
-    }
-
-    // Symmetric isolation: a sacred (maximized/fullscreen) incoming window only fits an empty
-    // workspace; a normal one only fits a workspace with no sacred window. 'continue' otherwise.
-    _sacredIsolationVerdict(window, workspace, monitor) {
-        const otherWindows = this._windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w => !WindowState.get(w, 'pendingInQueue') && w.get_id() !== window.get_id());
-
-        if (this._windowingManager.isMaximizedOrFullscreen(window)) {
-            if (otherWindows.length > 0) {
-                Logger.log(`canFitWindow: Incoming window is sacred but workspace ${workspace.index()} is occupied - blocked`);
-                return 'blocked';
-            }
-            Logger.log('canFitWindow: Window is sacred and workspace is empty - fits');
-            return 'fits';
-        }
-
-        if (otherWindows.some(w => this._windowingManager.isMaximizedOrFullscreen(w))) {
-            Logger.log(`canFitWindow: Incoming normal window blocked - workspace ${workspace.index()} has a sacred window`);
-            return 'blocked';
-        }
-        return 'continue';
-    }
-
-    _hasMaximizedWindow(metaWindows) {
-        return metaWindows.some(w => this._windowingManager.isMaximizedOrFullscreen(w));
     }
 
     // Space left for the incoming window after existing edge tiles, plus the ids to exclude
@@ -2681,7 +2636,7 @@ export const TilingManager = GObject.registerClass({
             return true;
         }
         if (this._windowingManager.isMaximizedOrFullscreen(window)) {
-            Logger.log(`savePreferredSize: Skipping for ${window.get_id()} - sacred window (managed by maximizedUndoInfo)`);
+            Logger.log(`savePreferredSize: Skipping for ${window.get_id()} - sacred window (last non-sacred size is preserved)`);
             return true;
         }
         if (WindowState.get(window, 'openedMaximized')) {
@@ -3495,15 +3450,14 @@ class WindowDescriptor {
         if (WindowState.get(window, PENDING_MINIATURE)) return;
 
         if (isDragging) {
-            this._drawDragging(window, x, y, masks, drawingManager);
+            this._drawDragging(window, x, y, masks);
         } else {
             this._drawResting(window, x, y);
         }
     }
 
-    _drawDragging(window, x, y, masks, drawingManager) {
+    _drawDragging(window, x, y, masks) {
         if (masks.has(this.id)) {
-            if (drawingManager) drawingManager.rect(x, y, this.width, this.height);
             return;
         }
         // Miniatures use actor transforms, since move_resize_frame would shrink the frame and compound the scale.
@@ -3694,10 +3648,11 @@ class Mask {
         this.height = window.height;
     }
     draw(_, x, y, _masks, _isDragging, drawingManager) {
-        if (drawingManager) {
-            // Don't clear boxes here; destroyMasks() already did it once at the start of tiling.
-            drawingManager.rect(x, y, this.width, this.height);
-        }
+        void x;
+        void y;
+        void this.width;
+        void this.height;
+        void drawingManager;
     }
 }
 

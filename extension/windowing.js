@@ -204,6 +204,13 @@ export const WindowingManager = GObject.registerClass({
         return new Promise(resolve => {
             const workspaceManager = global.workspace_manager;
             const monitor = window.get_monitor();
+            const stack = (new Error().stack ?? '')
+                .split('\n')
+                .slice(1, 4)
+                .map(line => line.trim())
+                .join(' | ');
+
+            Logger.log(`[MOVE OVERSIZED] request window=${window.get_id()} monitor=${monitor} options=${JSON.stringify(options)} stack=${stack}`);
 
             // Notify that overflow is starting
             if (this._overflowStartCallback) {
@@ -216,27 +223,19 @@ export const WindowingManager = GObject.registerClass({
             const currentIndex = window.get_workspace().index();
 
             Logger.log(`moveOversizedWindow: origin=${currentIndex}`);
-
-            const isSacred = this.isMaximizedOrFullscreen(window);
             const nextIndex = currentIndex + 1;
             const totalWorkspaces = workspaceManager.get_n_workspaces();
             let target_workspace = null;
 
             // GNOME's dynamic workspaces might not have a workspace at nextIndex yet
             const nextWorkspace = nextIndex < totalWorkspaces ? workspaceManager.get_workspace_by_index(nextIndex) : null;
-
-            if (isSacred) {
-                Logger.log(`[PLACEMENT] Sacred window detected - targeting strictly WS-${nextIndex} for isolation`);
-                target_workspace = this.createOrReuseAdjacentWorkspace(workspaceManager.get_workspace_by_index(currentIndex));
+            Logger.log(`[PLACEMENT] Overflow window detected - targeting strictly WS-${nextIndex}`);
+            if (nextWorkspace && this._tilingManager && this._tilingManager.canFitWindow(window, nextWorkspace, monitor)) {
+                Logger.log(`[PLACEMENT] Window fits in existing adjacent WS-${nextIndex}`);
+                target_workspace = nextWorkspace;
             } else {
-                Logger.log(`[PLACEMENT] Overflow window detected - targeting strictly WS-${nextIndex}`);
-                if (nextWorkspace && this._tilingManager && this._tilingManager.canFitWindow(window, nextWorkspace, monitor)) {
-                    Logger.log(`[PLACEMENT] Window fits in existing adjacent WS-${nextIndex}`);
-                    target_workspace = nextWorkspace;
-                } else {
-                    Logger.log(`[PLACEMENT] Adjacent WS-${nextIndex} is full or missing - creating new workspace`);
-                    target_workspace = this.createOrReuseAdjacentWorkspace(workspaceManager.get_workspace_by_index(currentIndex));
-                }
+                Logger.log(`[PLACEMENT] Adjacent WS-${nextIndex} is full or missing - creating new workspace`);
+                target_workspace = this.createOrReuseAdjacentWorkspace(workspaceManager.get_workspace_by_index(currentIndex));
             }
 
             const previous_workspace = window.get_workspace();
@@ -410,17 +409,6 @@ export const WindowingManager = GObject.registerClass({
 
     isMaximizedOrFullscreen(window) {
         return window.is_maximized() || window.is_fullscreen();
-    }
-
-    hasSacredWindow(workspace, monitor, excludeWindowId = null) {
-        if (!workspace || monitor === null || monitor === undefined)
-            return false;
-
-        const windows = this.getMonitorWorkspaceWindows(workspace, monitor);
-        return windows.some(w =>
-            (!excludeWindowId || w.get_id() !== excludeWindowId) &&
-            this.isMaximizedOrFullscreen(w)
-        );
     }
 
     renavigate(workspace, condition, lastVisitedIndex = null, monitorIndex = -1) {

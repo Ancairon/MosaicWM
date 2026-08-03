@@ -13,6 +13,14 @@ export const DRAG_LAYOUT_TIME_BUDGET_MS = 8;
 // A Super+Arrow only counts as an action if it moves the focused window's center at
 // least this far in the pressed direction; below it the key is a no-op.
 export const KEYBOARD_RECOMPOSE_MIN_DISPLACEMENT_PX = 20;
+// Predefined size steps for Super+WASD cycling (fractions of usable tiling dimension).
+// Steps below the window minimum size are silently skipped at runtime.
+export const RESIZE_CYCLE_FRACTIONS = [
+    0.05, 0.10, 0.15, 0.20, 0.25,
+    0.30, 0.35, 0.40, 0.45, 0.50,
+    0.55, 0.60, 0.65, 0.70, 0.75,
+    0.80, 0.85, 0.90, 0.95, 1.00
+];
 
 export const WINDOW_VALIDITY_CHECK_INTERVAL_MS = 10;
 
@@ -81,14 +89,11 @@ export const RESIZE_SETTLE_DELAY_MS = 150;       // Delay to let Mutter apply re
 export const RESIZE_CLAMP_SETTLE_WINDOW_MS = 1500; // Window age below which a clamp is treated as the client still settling
 export const RESIZE_CLAMP_VERIFY_DELAY_MS = 400; // Quiet time after a deferred clamp before the frame is committed as real
 export const ISRESIZING_FLAG_RESET_MS = 2;
-// Mutter can skip the size-changed confirmation on a fast maximize/unmaximize
-// toggle, so force the move after this long instead of leaving the window stuck.
-export const SACRED_RESTORE_SAFETY_TIMEOUT_MS = 1500;
 // New windows fire both window-created and window-added, which would otherwise
 // evaluate them twice. Skip a re-enqueue if we just evaluated this window.
 export const DUPLICATE_EVALUATION_WINDOW_MS = 300;
-// Wait this long after a maximize before isolating the window, so a quick
-// maximize/unmaximize toggle never even starts the move.
+// Wait this long after a maximize before retiling siblings around it, so a quick
+// maximize/unmaximize toggle never even triggers a retile.
 export const SACRED_ENTER_DEBOUNCE_MS = 200;
 
 export const ANIMATION_DIFF_THRESHOLD = 10;
