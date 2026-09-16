@@ -2759,11 +2759,8 @@ export const TilingManager = GObject.registerClass({
         const result = { overflow, layout: this._cachedTileResult?.windows || null, computedSlots };
         this.emit('mosaic-changed', workspace);
 
-        if (!isRecursive) {
-            for (const { window: win } of this._pendingMiniatureWindows ?? [])
-                WindowState.remove(win, PENDING_MINIATURE);
+        if (!isRecursive)
             this._pendingMiniatureWindows = [];
-        }
 
         return result;
     }
@@ -2881,12 +2878,25 @@ export const TilingManager = GObject.registerClass({
                 WindowState.remove(w, 'restoreAnchorCenter');
         }
 
+        this._clearPendingMiniatureFlags();
+
         if (!(this._pendingMiniatureWindows?.length > 0) || !this._extension?.miniatureManager) return;
         for (const { window: win, preSize } of this._pendingMiniatureWindows) {
             // Skip if already miniaturized, since an earlier tile call may have created it first.
             if (WindowState.get(win, IS_MINIATURE)) continue;
             this._createOnePendingMiniature(win, preSize, computedSlots, tileArea);
         }
+        // Every entry here is now either applied or superseded; nothing stays pending, or a
+        // later, independent pass (e.g. the no-ref overflow resolver) that appends onto this
+        // same array would find a stale entry here and apply it ahead of its own fresh one.
+        this._pendingMiniatureWindows = [];
+    }
+
+    // Consumed either way, even when no miniature can be made; a flag left behind makes
+    // draw() skip the window for good.
+    _clearPendingMiniatureFlags() {
+        for (const { window: win } of this._pendingMiniatureWindows ?? [])
+            WindowState.remove(win, PENDING_MINIATURE);
     }
 
     _createOnePendingMiniature(win, preSize, computedSlots, tileArea) {
