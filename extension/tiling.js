@@ -3360,8 +3360,9 @@ export const TilingManager = GObject.registerClass({
         const candidateDesc = descriptors.find(d => d.window === candidateMini);
         const simAtLo = sizeAt(candidateDesc, lo);
         const maxSize = this.getWindowMaximumSize(candidateMini);
-        const thresholdW = (candidateDesc.min.width + (maxSize?.width || workArea.width)) / 2;
-        const thresholdH = (candidateDesc.min.height + (maxSize?.height || workArea.height)) / 2;
+        // Capped like _miniatureThreshold, so a max past the monitor can't refuse every restore.
+        const thresholdW = (candidateDesc.min.width + Math.min(maxSize?.width || workArea.width, workArea.width)) / 2;
+        const thresholdH = (candidateDesc.min.height + Math.min(maxSize?.height || workArea.height, workArea.height)) / 2;
         const wouldStayMini = simAtLo.width < thresholdW || simAtLo.height < thresholdH;
 
         Logger.log(`canRestoreMiniature: candidate=${candidateMini.get_id()} doesn't fit at preferred size, optimal scale=${lo.toFixed(4)} → ${simAtLo.width}x${simAtLo.height} (threshold ${Math.round(thresholdW)}x${Math.round(thresholdH)}), wouldStayMini=${wouldStayMini}`);
@@ -3762,8 +3763,9 @@ export const TilingManager = GObject.registerClass({
     _miniatureThreshold(w, workArea) {
         const min = this.getWindowMinimumSize(w);
         const maxSize = this.getWindowMaximumSize(w);
-        const effectiveMaxW = maxSize?.width || workArea.width;
-        const effectiveMaxH = maxSize?.height || workArea.height;
+        // Some clients publish a max past the monitor, which pins the threshold to preferred.
+        const effectiveMaxW = Math.min(maxSize?.width || workArea.width, workArea.width);
+        const effectiveMaxH = Math.min(maxSize?.height || workArea.height, workArea.height);
         return {
             thresholdW: (min.width + effectiveMaxW) / 2,
             thresholdH: (min.height + effectiveMaxH) / 2,
