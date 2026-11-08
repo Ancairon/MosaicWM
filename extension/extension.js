@@ -21,7 +21,6 @@ import * as constants from './constants.js';
 import { SettingsOverrider } from './settingsOverrider.js';
 
 import { EdgeTilingManager } from './edgeTiling.js';
-import { TileZone } from './constants.js';
 import { TilingManager } from './tiling.js';
 import { isWindowAlive, isWorkspaceAlive } from './liveness.js';
 import { ReorderingManager } from './reordering.js';
@@ -193,8 +192,7 @@ export default class WindowMosaicExtension extends Extension {
 
         this._currentWorkspaceIndex = newIndex;
 
-        // Wait for workspace switch animation to complete before any tiling operations
-        // This prevents race conditions where tiling starts while animation is still running
+        // Tiling while the switch animation runs races it; wait until it finishes.
         afterAnimations(this.animationsManager, () => {
             Logger.log(`Workspace animation complete - ready for operations on workspace ${newIndex}`);
         }, this._timeoutRegistry);
@@ -568,7 +566,9 @@ export default class WindowMosaicExtension extends Extension {
                     this.tilingManager.savePreferredSize(window);
                 }
 
-                // Always connect exclusion signals, even if excluded
+                // Exclusion can flip later (always-on-top toggled off, unstuck from all
+                // workspaces), and unmanaged has to fire regardless for cleanup either way,
+                // so an excluded window still needs to be wired up now.
                 this.windowHandler.connectWindowSignals(window);
             }
         }
@@ -600,11 +600,20 @@ export default class WindowMosaicExtension extends Extension {
         this._dndLeaveId = this._dnd.connect('dnd-leave', this._onDndLeave.bind(this));
     }
 
+    // Take only our combo off GNOME's list. Clearing the key would take its other bindings
+    // with it, and unmaximize also carries Alt+F5.
+    _releaseBinding(settings, key, combo) {
+        const bindings = settings.get_strv(key);
+        const remaining = bindings.filter(binding => binding !== combo);
+        // Registered even when the combo is already gone, since that means a run took it and died
+        // before disable(); bailing out here is what leaves the key without it for good.
+        this._settingsOverrider.add(settings, key, new GLib.Variant('as', remaining));
+    }
+
     // Clear the stock GNOME shortcuts that collide with ours, but only when they still hold
     // their default combo, so a user who rebound them keeps their choice.
     _overrideConflictingKeybindings() {
         const mutterKeybindings = new Gio.Settings({ schema_id: 'org.gnome.mutter.keybindings' });
-        const desktopWmKeybindings = new Gio.Settings({ schema_id: 'org.gnome.desktop.wm.keybindings' });
         const emptyArray = new GLib.Variant('as', []);
 
         if (mutterKeybindings.get_strv('toggle-tiled-left').includes('<Super>Left')) {
@@ -612,12 +621,6 @@ export default class WindowMosaicExtension extends Extension {
         }
         if (mutterKeybindings.get_strv('toggle-tiled-right').includes('<Super>Right')) {
             this._settingsOverrider.add(mutterKeybindings, 'toggle-tiled-right', emptyArray);
-        }
-        if (desktopWmKeybindings.get_strv('maximize').includes('<Super>Up')) {
-            this._settingsOverrider.add(desktopWmKeybindings, 'maximize', emptyArray);
-        }
-        if (desktopWmKeybindings.get_strv('unmaximize').includes('<Super>Down')) {
-            this._settingsOverrider.add(desktopWmKeybindings, 'unmaximize', emptyArray);
         }
 
         const shellKeybindings = new Gio.Settings({ schema_id: 'org.gnome.shell.keybindings' });
@@ -629,6 +632,10 @@ export default class WindowMosaicExtension extends Extension {
         if (shellKeybindings.get_strv('shift-overview-down').includes('<Super><Alt>Down')) {
             this._settingsOverrider.add(shellKeybindings, 'shift-overview-down', emptyArray);
         }
+
+        const wmKeybindings = new Gio.Settings({ schema_id: 'org.gnome.desktop.wm.keybindings' });
+        this._releaseBinding(wmKeybindings, 'maximize', '<Super>Up');
+        this._releaseBinding(wmKeybindings, 'unmaximize', '<Super>Down');
     }
 
     // A straight run to the app grid is one transition from 0 to 2, so currentState alone
@@ -830,12 +837,26 @@ export default class WindowMosaicExtension extends Extension {
                         WindowState.remove(w, 'isReverseSmartResizing');
                     }
                     this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
+                    this._tryCascadeMiniatureRestore(workspace, monitor);
                     return GLib.SOURCE_REMOVE;
                 }, 'miniatureRestoreGrowSettle');
+            } else {
+                this._tryCascadeMiniatureRestore(workspace, monitor);
             }
         };
 
         doTile();
+    }
+
+    // One restore can leave enough room for the next MRU miniature too; restoreMiniature
+    // fires this same handler synchronously, so this just keeps the chain going until
+    // nothing else fits, the same way a single window leaving already restores one.
+    _tryCascadeMiniatureRestore(workspace, monitor) {
+        if (this.dragHandler?._suppressRestoreRetile) return;
+
+        const remaining = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
+            .filter(w => !this.edgeTilingManager.isEdgeTiled(w) && !this.windowingManager.isExcluded(w));
+        this.windowHandler?._tryAutoRestoreMiniature(remaining, workspace, monitor);
     }
 
     _onDndEnter() {
@@ -865,22 +886,16 @@ export default class WindowMosaicExtension extends Extension {
         const settings = this.getSettings('org.gnome.shell.extensions.mosaic-wm');
 
         Main.wm.addKeybinding('tile-left', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.LEFT_FULL));
+            () => this._onArrowShortcut('left'));
 
         Main.wm.addKeybinding('tile-right', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.RIGHT_FULL));
+            () => this._onArrowShortcut('right'));
 
-        Main.wm.addKeybinding('tile-top-left', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.TOP_LEFT));
+        Main.wm.addKeybinding('maximize-window', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this._onArrowShortcut('up'));
 
-        Main.wm.addKeybinding('tile-top-right', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.TOP_RIGHT));
-
-        Main.wm.addKeybinding('tile-bottom-left', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.BOTTOM_LEFT));
-
-        Main.wm.addKeybinding('tile-bottom-right', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.BOTTOM_RIGHT));
+        Main.wm.addKeybinding('restore-window', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this._onArrowShortcut('down'));
 
         Logger.log('Registering swap-left keybinding');
         Main.wm.addKeybinding('swap-left', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
@@ -1087,29 +1102,62 @@ export default class WindowMosaicExtension extends Extension {
         WindowState.set(window, 'keyboardResizeTimeoutId', timeoutId);
     }
 
-    _tileActiveWindow(zone) {
+    _onArrowShortcut(direction) {
         const window = global.display.focus_window;
-        if (!window) {
-            Logger.log('No active window to tile');
-            return;
-        }
-
-        if (this.windowingManager.isExcluded(window)) {
-            Logger.log('Window is excluded from tiling');
-            return;
-        }
+        if (!window) return;
 
         const workspace = window.get_workspace();
-        if (!this.isMosaicEnabledForWorkspace(workspace)) {
-            Logger.log('Mosaic disabled for workspace - ignoring tile shortcut');
+
+        // Super+Up/Down are GNOME's for every window we don't manage, so swallowing the key
+        // here would strip maximize from dialogs and from mosaic-disabled workspaces.
+        if (!workspace || this.windowingManager.isExcluded(window) ||
+            !this.isMosaicEnabledForWorkspace(workspace)) {
+            this._applyStockVertical(window, direction);
             return;
         }
 
-        const monitor = window.get_monitor();
-        const workArea = workspace.get_work_area_for_monitor(monitor);
+        const intent = this.edgeTilingManager.resolveArrowIntent(window, direction);
+        Logger.log(`Arrow ${direction} on window ${window.get_id()}: intent=${intent.kind}${intent.zone ? ` zone=${intent.zone}` : ''}`);
+        this._applyArrowIntent(window, workspace, intent);
+    }
 
-        Logger.log(`Keyboard shortcut: tiling window ${window.get_id()} to zone ${zone}`);
-        this.edgeTilingManager.applyTile(window, zone, workArea);
+    _applyArrowIntent(window, workspace, intent) {
+        switch (intent.kind) {
+            case 'tile': {
+                const workArea = workspace.get_work_area_for_monitor(window.get_monitor());
+                this.edgeTilingManager.applyTile(window, intent.zone, workArea);
+                break;
+            }
+            case 'restore':
+                this._restoreWindow(window);
+                break;
+            case 'unmaximize':
+                window.unmaximize();
+                break;
+            case 'swap':
+                this.swappingManager.swapVerticalQuarterPair(window, intent.direction);
+                break;
+            case 'maximize':
+                if (window.can_maximize()) window.maximize();
+                break;
+        }
+    }
+
+    // Mirrors the stock handlers we replaced, which never force a window that says it can't.
+    // The side arrows come through here too, so both branches have to name their direction.
+    _applyStockVertical(window, direction) {
+        if (direction === 'up' && window.can_maximize()) window.maximize();
+        else if (direction === 'down' && window.is_maximized()) window.unmaximize();
+    }
+
+    _restoreWindow(window) {
+        if (this.edgeTilingManager.isEdgeTiled(window)) {
+            this.edgeTilingManager.removeTile(window, () => {
+                if (!isWindowAlive(window)) return;
+                this.tilingManager.tileWorkspaceWindows(
+                    window.get_workspace(), null, window.get_monitor());
+            });
+        }
     }
 
     _swapActiveWindow(direction) {
@@ -1175,10 +1223,8 @@ export default class WindowMosaicExtension extends Extension {
     _removeKeybindings() {
         Main.wm.removeKeybinding('tile-left');
         Main.wm.removeKeybinding('tile-right');
-        Main.wm.removeKeybinding('tile-top-left');
-        Main.wm.removeKeybinding('tile-top-right');
-        Main.wm.removeKeybinding('tile-bottom-left');
-        Main.wm.removeKeybinding('tile-bottom-right');
+        Main.wm.removeKeybinding('maximize-window');
+        Main.wm.removeKeybinding('restore-window');
         Main.wm.removeKeybinding('swap-left');
         Main.wm.removeKeybinding('swap-right');
         Main.wm.removeKeybinding('swap-up');

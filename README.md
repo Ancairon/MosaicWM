@@ -34,7 +34,8 @@ The consistent principle behind both: nothing should require the user to think a
 - Overflow to another workspace for windows that cannot shrink any further
 - Edge tiling to halves and quarters by dragging to a screen edge, with consistent half-spacing screen margins and the remaining windows adapting to what is left
 - Window swapping by dragging one window onto another
-- Move the focused window around the mosaic grid with `Super+Left/Right/Up/Down`
+- Move the focused window around the mosaic grid with `Super+Left/Right` and `Super+Alt+Up/Down`
+- Walk the focused window through its tiling stack with `Super+Up/Down`: trade places with a quarter partner, maximize off the top, return to the mosaic off the bottom
 - Cycle the focused window's width/height through 5% presets with `Super+W/A/S/D`, wrapping at both ends
 - Fullscreen and maximized windows stay on their current workspace instead of being isolated to a dedicated one; in the Overview they are kept behind the other Mosaic thumbnails
 - Windows grow back toward their preferred size when neighbours close or miniaturize
@@ -85,7 +86,8 @@ There is nothing to configure. Once enabled:
 - **Open windows**: They'll be automatically tiled
 - **Drag windows**: Click and drag to reorder, or to a screen edge for half/quarter tiling
 - **Swap windows**: Drag a window onto another to swap their positions
-- **Grid movement**: `Super+Left`, `Super+Right`, `Super+Up`, and `Super+Down` move the focused window toward the neighboring grid slot when one exists
+- **Grid movement**: `Super+Left`, `Super+Right`, `Super+Alt+Up`, and `Super+Alt+Down` move the focused window toward the neighboring grid slot when one exists
+- **Tiling stack**: `Super+Up` swaps a bottom quarter with the quarter above it, or maximizes; `Super+Down` swaps a top quarter with the one below it, unmaximizes, or returns a tiled window to the mosaic
 - **Keyboard resize**: `Super+D` cycles width up, `Super+A` cycles width down, `Super+W` cycles height up, and `Super+S` cycles height down through 5% presets from 5% to 100% of the usable tiling area, wrapping at both ends
 - **Maximize/Fullscreen**: Window stays on its current workspace; in Overview it is kept behind the other Mosaic thumbnails
 - **Minimize**: Window is excluded from tiling

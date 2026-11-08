@@ -10,6 +10,10 @@ export const MAX_DRAG_LAYOUTS = 48;
 // Wall-clock ceiling for composition generation at drag start; a last-resort guard
 // against pathological window counts.
 export const DRAG_LAYOUT_TIME_BUDGET_MS = 8;
+// Counted, not timed: a clock ceiling makes the same windows land in different layouts
+// depending on how busy the shell was. Sized so four windows always scan in full, both
+// orientations included (24 orders x 6 shapes).
+export const LAYOUT_SEARCH_CANDIDATE_BUDGET = 192;
 // A Super+Arrow only counts as an action if it moves the focused window's center at
 // least this far in the pressed direction; below it the key is a no-op.
 export const KEYBOARD_RECOMPOSE_MIN_DISPLACEMENT_PX = 20;
@@ -86,8 +90,11 @@ export const EDGE_TILE_RESTORE_DELAY_MS = 300;  // Delay to prevent false overfl
 export const GEOMETRY_WAIT_MAX_ATTEMPTS = 100;   // Max attempts to wait for window geometry (100 * 10ms = 1s)
 export const REVERSE_RESIZE_PROTECTION_MS = 1000; // Protection window for reverse smart resize/unmaximize/overflow
 export const RESIZE_SETTLE_DELAY_MS = 150;       // Delay to let Mutter apply resize before retiling
+export const RESIZE_SETTLE_MAX_ATTEMPTS = 4;     // Settle checks before the restored-size bridge is dropped anyway
+export const EDGE_TILE_EXIT_SUPPRESSION_MS = RETILE_DELAY_MS + RESIZE_SETTLE_DELAY_MS; // Matches removeTile's targetRestoredSize bridge
 export const RESIZE_CLAMP_SETTLE_WINDOW_MS = 1500; // Window age below which a clamp is treated as the client still settling
 export const RESIZE_CLAMP_VERIFY_DELAY_MS = 400; // Quiet time after a deferred clamp before the frame is committed as real
+export const PIN_OVERFLOW_GRACE_MS = 300; // Overflow must survive this long before a pinned shape is dropped for good
 export const ISRESIZING_FLAG_RESET_MS = 2;
 // New windows fire both window-created and window-added, which would otherwise
 // evaluate them twice. Skip a re-enqueue if we just evaluated this window.
@@ -119,10 +126,6 @@ export const MINIATURE_ANIM_MS = 250;
 export const MINIATURE_FOCUS_GUARD_MS = 500;  // Block focus-triggered restore right after miniaturizing
 export const MINIATURE_HOVER_REST_MS = 300;  // How long the pointer must rest on a miniature before focus-follows-mouse restores it
 export const DND_MINIATURE_RESTORE_DELAY_MS = 400;  // Dwell time over a miniature before a DnD hover triggers restore
-
-// Restored window's distance to its old slot is the primary layout pick; layouts
-// whose distances land within this many px tie, so shelves still break near-ties.
-export const RESTORE_PROXIMITY_TOLERANCE_PX = 100;
 
 // Compact the per-workspace swap history into a single canonical order op
 // once it grows past this many entries (keeps replay cost bounded)

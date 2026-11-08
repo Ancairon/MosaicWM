@@ -11,25 +11,15 @@
       <summary>Tile window to right</summary>
       <description>Tile the active window to the right half of the screen. Unbound by default.</description>
     </key>
-    <key name="tile-top-left" type="as">
-      <default>['&lt;Super&gt;&lt;Ctrl&gt;Left']</default>
-      <summary>Tile window to top-left quarter</summary>
-      <description>Tile the active window to the top-left quarter of the screen</description>
+    <key name="maximize-window" type="as">
+      <default>['&lt;Super&gt;Up']</default>
+      <summary>Maximize window</summary>
+      <description>Maximize the active window, or move it up the tiling stack</description>
     </key>
-    <key name="tile-top-right" type="as">
-      <default>['&lt;Super&gt;&lt;Ctrl&gt;Right']</default>
-      <summary>Tile window to top-right quarter</summary>
-      <description>Tile the active window to the top-right quarter of the screen</description>
-    </key>
-    <key name="tile-bottom-left" type="as">
-      <default>['&lt;Super&gt;&lt;Shift&gt;Left']</default>
-      <summary>Tile window to bottom-left quarter</summary>
-      <description>Tile the active window to the bottom-left quarter of the screen</description>
-    </key>
-    <key name="tile-bottom-right" type="as">
-      <default>['&lt;Super&gt;&lt;Shift&gt;Right']</default>
-      <summary>Tile window to bottom-right quarter</summary>
-      <description>Tile the active window to the bottom-right quarter of the screen</description>
+    <key name="restore-window" type="as">
+      <default>['&lt;Super&gt;Down']</default>
+      <summary>Restore window</summary>
+      <description>Move the active window down the tiling stack, back to the mosaic</description>
     </key>
     <key name="swap-left" type="as">
       <default>['&lt;Super&gt;Left']</default>
@@ -42,14 +32,14 @@
       <description>Swap the active window with its right neighbor (mosaic or tiling)</description>
     </key>
     <key name="swap-up" type="as">
-      <default>['&lt;Super&gt;Up']</default>
+      <default>['&lt;Super&gt;&lt;Alt&gt;Up']</default>
       <summary>Swap window upward</summary>
-      <description>Swap the active window with its upper neighbor in the mosaic grid, or the upper quarter-tile neighbor when edge-tiling applies</description>
+      <description>Move the active window to its upper neighbor in the mosaic grid</description>
     </key>
     <key name="swap-down" type="as">
-      <default>['&lt;Super&gt;Down']</default>
+      <default>['&lt;Super&gt;&lt;Alt&gt;Down']</default>
       <summary>Swap window downward</summary>
-      <description>Swap the active window with its lower neighbor in the mosaic grid, or the lower quarter-tile neighbor when edge-tiling applies</description>
+      <description>Move the active window to its lower neighbor in the mosaic grid</description>
     </key>
     <key name="resize-left-edge" type="as">
       <default>['&lt;Super&gt;a']</default>

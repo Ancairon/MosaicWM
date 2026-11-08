@@ -27,9 +27,11 @@ import { isWindowAlive } from './liveness.js';
 import { getSlowDownFactor, monotonicNow } from './timing.js';
 
 const POSITION_STABILITY_WEIGHT = 40;
-// High enough to beat the other terms combined (they max out at 140), so
-// keeping a window's column/shelf wins unless that option would overflow.
+// Tuning these two changes nothing on its own since they rank in tiers, never in one sum.
 const GROUP_STABILITY_WEIGHT = 150;
+// How much a hole in the middle counts against a layout whose window centers are close. The
+// measured miniature-between-two-columns scene flips at 0.25, so this keeps a margin over it.
+const HOLLOW_CENTER_WEIGHT = 0.3;
 
 // Every ordered composition of n into 1..n groups (n=3 gives [3],[2,1],[1,2],[1,1,1]).
 // A lazy generator on purpose: the count is 2^(n-1), so callers iterate under a time
@@ -80,6 +82,8 @@ export const TilingManager = GObject.registerClass({
         // Live for the whole grab, unlike isDragging/masks, which only exist once startDrag runs. The
         // edge tile exit tiles before that point, and the layout can't move what the cursor is holding.
         this._grabbedWindowId = null;
+        // Mirrors isDragging for a live manual resize; resizeHandler owns the toggle.
+        this.isResizing = false;
         this.dragRemainingSpace = null;
         this._dragMiniaturizationAllowed = true;
         // During a drag the drag layouts are the single source of truth for geometry: the cursor
@@ -101,6 +105,8 @@ export const TilingManager = GObject.registerClass({
         // it is keyed by workspace GObjects that come and go (like _workspaceSwaps).
         this._pinnedComposition = new WeakMap();
         this._activePinnedShape = null;
+        this._activePinnedVertical = null;
+        this._activePinnedWorkspace = null;
 
         // Layout cache to avoid redundant O(n!) permutation calculations
         this._lastLayoutHash = null;
@@ -108,6 +114,15 @@ export const TilingManager = GObject.registerClass({
         this._lastTiledOrder = null;
         // windowId -> levelIndex from the last committed tile pass
         this._lastGroupAssignment = null;
+        this._lastTiledVertical = null;
+        // The column packing that produced the last layout, as windows per row per column
+        this._lastTiledShape = null;
+        // The row packing that produced the last horizontal layout, as windows per row
+        this._lastTiledRowCounts = null;
+        // Whether the last committed pass ranked its order; an unranked one (fit check, drag)
+        // is whatever arrival order happened to pack, not a settled state worth trusting.
+        this._lastTileRanked = false;
+        this._pinnedSizesUnchanged = false;
         this._skipStabilityForNextTile = false;
 
         // Swap/reorder operations live per workspace, keyed by Meta.Workspace via WeakMap
@@ -306,7 +321,6 @@ export const TilingManager = GObject.registerClass({
         if (this._drawingManager) {
             this._drawingManager.removeBoxes();
         }
-        // Clear logical masks only when not dragging; recycle boxes otherwise.
         if (!this.isDragging) {
             this.masks.clear();
         }
@@ -372,7 +386,7 @@ export const TilingManager = GObject.registerClass({
         return this._cachedTileResult?.windows || null;
     }
 
-    _extractLayoutPositions(tile_info, work_area) {
+    _extractLayoutPositions(tile_info) {
         const positions = [];
 
         if (!tile_info.vertical) {
@@ -380,12 +394,10 @@ export const TilingManager = GObject.registerClass({
             for (const level of tile_info.levels) {
                 let x = level.x;
                 for (const win of level.windows) {
-                    const center_offset = (work_area.height / 2 + work_area.y) - (y + win.height / 2);
-                    let y_offset = 0;
-                    if (center_offset > 0)
-                        y_offset = Math.min(center_offset, level.height - win.height);
+                    const drawX = win.targetX !== undefined ? win.targetX : x;
+                    const drawY = win.targetY !== undefined ? win.targetY : y;
 
-                    positions.push({ id: win.id, x: x, y: y + y_offset, width: win.width, height: win.height });
+                    positions.push({ id: win.id, x: drawX, y: drawY, width: win.width, height: win.height });
                     x += win.width + constants.WINDOW_SPACING;
                 }
                 y += level.height + constants.WINDOW_SPACING;
@@ -422,16 +434,27 @@ export const TilingManager = GObject.registerClass({
         return tooTall || isNarrow || tooWide;
     }
 
+    // The windows that stay put have to hold the order they are on screen, not the stacking
+    // order the caller hands over: on a tight layout that one is the composition that does not fit.
+    _inTiledOrder(windows) {
+        if (!this._lastTiledOrder) return windows;
+        const rank = new Map(this._lastTiledOrder.map((id, i) => [id, i]));
+        return [...windows].sort((a, b) =>
+            (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity));
+    }
+
     computeDragLayouts(windowDescriptors, workArea, draggedId) {
         const spacing = constants.WINDOW_SPACING;
         const startTime = GLib.get_monotonic_time();
 
-        const useVertical = this._useVerticalForDrag(windowDescriptors, workArea);
+        // Whatever orientation _tile will settle on: built the other way round every shape
+        // overflows and the drag ends up with an empty list, so nothing ever previews.
+        const useVertical = this._orientationFor(windowDescriptors, workArea);
 
         const n = windowDescriptors.length;
         const dragged = windowDescriptors.find(w => w.id === draggedId);
         if (!dragged) return [];
-        const others = windowDescriptors.filter(w => w.id !== draggedId);
+        const others = this._inTiledOrder(windowDescriptors.filter(w => w.id !== draggedId));
 
         const layouts = [];
         const seenPositions = new Set();
@@ -452,7 +475,7 @@ export const TilingManager = GObject.registerClass({
                 const result = this._placeByShape(ordered, workArea, spacing, shape, useVertical);
                 if (result.overflow) continue;
 
-                const positions = this._extractLayoutPositions(result, workArea);
+                const positions = this._extractLayoutPositions(result);
                 const draggedPos = positions.find(p => p.id === draggedId);
                 if (!draggedPos) continue;
 
@@ -465,6 +488,7 @@ export const TilingManager = GObject.registerClass({
                     positions,
                     permOrder: ordered.map(w => w.id),
                     shape,
+                    vertical: useVertical,
                 });
 
                 if (layouts.length >= constants.MAX_DRAG_LAYOUTS) break outer;
@@ -612,9 +636,10 @@ export const TilingManager = GObject.registerClass({
 
     // Persist a chosen composition for the workspace. Ordering rides the existing order-op
     // path; only the shape is new. Honored by _tile until the window count changes or the
-    // shape stops fitting.
-    pinComposition(workspace, shape, order) {
-        this._pinnedComposition.set(workspace, { count: order.length, shape });
+    // shape stops fitting. vertical is the axis the shape was verified against (see
+    // _orientationFor for why that can't just be re-derived on the next pass).
+    pinComposition(workspace, shape, order, vertical) {
+        this._pinnedComposition.set(workspace, { count: order.length, shape, vertical });
         Logger.log(`pinComposition: pinned shape [${shape.join(',')}] for ${order.length} windows`);
         this.applyOrderOp(workspace, order);
     }
@@ -646,11 +671,13 @@ export const TilingManager = GObject.registerClass({
         const n = descriptors.length;
         if (n < 2) return null;
 
-        const useVertical = this._useVerticalForDrag(descriptors, workArea);
+        // Same reason as the drag path: off the orientation _tile picks every shape overflows
+        // and the search returns null without a word.
+        const useVertical = this._orientationFor(descriptors, workArea);
 
         const focused = descriptors.find(w => w.id === focusedWindow.get_id());
         if (!focused) return null;
-        const others = descriptors.filter(w => w.id !== focusedWindow.get_id());
+        const others = this._inTiledOrder(descriptors.filter(w => w.id !== focusedWindow.get_id()));
         const f0 = focusedWindow.get_frame_rect();
         const sign = direction === 'right' || direction === 'down' ? 1 : -1;
         const axis = direction === 'left' || direction === 'right' ? 'x' : 'y';
@@ -675,13 +702,13 @@ export const TilingManager = GObject.registerClass({
                 ordered.splice(slot, 0, focused);
                 const result = this._placeByShape(ordered, workArea, spacing, shape, useVertical);
                 if (result.overflow) continue;
-                const positions = this._extractLayoutPositions(result, workArea);
+                const positions = this._extractLayoutPositions(result);
                 const fp = positions.find(p => p.id === focusedId);
                 if (!fp) continue;
                 const center = axis === 'x' ? fp.x + fp.width / 2 : fp.y + fp.height / 2;
                 const disp = sign * (center - originCenter);
                 if (disp >= constants.KEYBOARD_RECOMPOSE_MIN_DISPLACEMENT_PX && (!best || disp > best.displacement))
-                    best = { shape, order: ordered.map(w => w.id), displacement: disp };
+                    best = { shape, order: ordered.map(w => w.id), displacement: disp, vertical: useVertical };
             }
         }
         return best;
@@ -777,49 +804,95 @@ export const TilingManager = GObject.registerClass({
         return result;
     }
 
-    _scoreLayout(tileResult, workArea) {
-        if (!tileResult || tileResult.overflow) return -Infinity;
-
-        let minX = Infinity, minY = Infinity, maxX = 0, maxY = 0;
-        let totalArea = 0;
-
-        for (const level of tileResult.levels) {
-            for (const w of level.windows) {
-                const x = w.targetX || level.x;
-                const y = w.targetY || level.y;
-                minX = Math.min(minX, x);
-                minY = Math.min(minY, y);
-                maxX = Math.max(maxX, x + w.width);
-                maxY = Math.max(maxY, y + w.height);
-                totalArea += w.width * w.height;
+    // Stacking two windows would beat side by side on a 16:9 if both axes shared one scale,
+    // the opposite of what a wide screen asks for.
+    _pairwiseDensity(centers, workArea) {
+        let maxPair = 0, sum = 0, pairs = 0;
+        for (let i = 0; i < centers.length; i++) {
+            for (let j = i + 1; j < centers.length; j++) {
+                const d = Math.hypot(
+                    (centers[i].x - centers[j].x) / workArea.width,
+                    (centers[i].y - centers[j].y) / workArea.height);
+                maxPair = Math.max(maxPair, d);
+                sum += d;
+                pairs++;
             }
         }
+        return { maxPair, meanPair: pairs ? sum / pairs : 0 };
+    }
 
-        if (minX === Infinity) return -Infinity;
+    // A pool holding anything that fits drops the overflowing ones first, so these only ever
+    // compete against each other; unscored, that comparison is a coin flip.
+    _scoreLayout(tileResult, workArea) {
+        if (!tileResult) return null;
 
-        const bboxWidth = maxX - minX;
-        const bboxHeight = maxY - minY;
-        const bboxArea = bboxWidth * bboxHeight;
+        const centers = [];
+        for (const level of tileResult.levels) {
+            for (const w of level.windows) {
+                centers.push({
+                    x: (w.targetX ?? level.x) + w.width / 2,
+                    y: (w.targetY ?? level.y) + w.height / 2,
+                });
+            }
+        }
+        if (centers.length === 0) return null;
 
-        const compactness = totalArea / Math.max(bboxArea, 1);
+        const { maxPair, meanPair } = this._pairwiseDensity(centers, workArea);
 
-        const bboxCenterX = minX + bboxWidth / 2;
-        const bboxCenterY = minY + bboxHeight / 2;
-        const workCenterX = workArea.x + workArea.width / 2;
-        const workCenterY = workArea.y + workArea.height / 2;
-        const centerDist = Math.sqrt(
-            Math.pow(bboxCenterX - workCenterX, 2) +
-            Math.pow(bboxCenterY - workCenterY, 2)
-        );
-        const maxDist = Math.sqrt(Math.pow(workArea.width, 2) + Math.pow(workArea.height, 2)) / 2;
-        const centralization = 1 - (centerDist / maxDist);
+        let minX = Infinity, minY = Infinity, maxX = 0, maxY = 0;
+        for (const c of centers) {
+            minX = Math.min(minX, c.x); maxX = Math.max(maxX, c.x);
+            minY = Math.min(minY, c.y); maxY = Math.max(maxY, c.y);
+        }
+        const centerDist = Math.hypot(
+            (minX + maxX) / 2 - (workArea.x + workArea.width / 2),
+            (minY + maxY) / 2 - (workArea.y + workArea.height / 2));
+        const maxDist = Math.hypot(workArea.width, workArea.height) / 2;
 
-        const sizeEfficiency = 1 - (bboxArea / (workArea.width * workArea.height));
+        // Bounding box area is gone on purpose: a long thin strip has less area than a square
+        // block, so it rewarded exactly the most spread out arrangement.
+        const hollow = this._hollowCenter(tileResult, workArea);
+        return {
+            maxPair, meanPair, hollow,
+            density: maxPair + HOLLOW_CENTER_WEIGHT * hollow,
+            centralization: 1 - centerDist / maxDist,
+        };
+    }
 
-        let score = compactness * 50 + centralization * 30 + sizeEfficiency * 20;
-        score += this._positionStabilityBonus(tileResult, workArea);
-        score += this._groupStabilityBonus(tileResult);
-        return score;
+    // A shallow level leaves bare screen beside it, which is a lone miniature parked between two
+    // full columns. Pairwise distance can't see it: the miniature sitting there keeps centers close.
+    _hollowCenter(tileResult, workArea) {
+        const levels = tileResult.levels;
+        if (levels.length < 3) return 0;
+
+        const vertical = !!tileResult.vertical;
+        const axis = vertical ? workArea.width : workArea.height;
+        const origin = (vertical ? workArea.x : workArea.y) + axis / 2;
+        const boxes = levels.map(lv => this._levelBox(lv));
+        const depth = b => (vertical ? b.y1 - b.y0 : b.x1 - b.x0);
+        const along = b => (vertical ? (b.x0 + b.x1) / 2 : (b.y0 + b.y1) / 2);
+        const deepest = Math.max(...boxes.map(depth));
+
+        let hollow = 0;
+        for (const b of boxes) {
+            // An overflowing level sits past the edge, where the raw weight goes negative and
+            // would pay a layout for shoving its shallowest level off screen.
+            const centered = Math.max(0, 1 - Math.abs(along(b) - origin) / (axis / 2));
+            hollow += (deepest - depth(b)) * centered;
+        }
+
+        return hollow / (vertical ? workArea.height : workArea.width);
+    }
+
+    _levelBox(level) {
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const w of level.windows) {
+            const x = w.targetX ?? level.x;
+            const y = w.targetY ?? level.y;
+            x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+            x1 = Math.max(x1, x + w.width); y1 = Math.max(y1, y + w.height);
+        }
+        return { x0, y0, x1, y1 };
     }
 
     // Reward a layout that leaves windows near where they already sat, so a retile doesn't
@@ -831,7 +904,10 @@ export const TilingManager = GObject.registerClass({
         let count = 0;
         for (const level of tileResult.levels) {
             for (const w of level.windows) {
-                const snap = this._positionSnapshot.get(w.id);
+                // A window mid-restore is already scaling back up, so its frame no longer reports
+                // the slot the user last saw it in; the anchor does.
+                const snap = this._restoreAnchor?.id === w.id
+                    ? this._restoreAnchor : this._positionSnapshot.get(w.id);
                 if (!snap) continue;
                 const px = (w.targetX ?? level.x) + w.width / 2;
                 const py = (w.targetY ?? level.y) + w.height / 2;
@@ -846,92 +922,198 @@ export const TilingManager = GObject.registerClass({
         return (1 - normalized) * POSITION_STABILITY_WEIGHT;
     }
 
+    // Pairs, not level indices: a column inserted at the front renumbers everyone and fakes a regroup.
+    _coMembershipPairs(levels, allowed = null) {
+        const pairs = new Set();
+        for (const level of levels) {
+            const ids = level.windows.map(w => w.id)
+                .filter(id => !allowed || allowed.has(id))
+                .sort((a, b) => a - b);
+            for (let i = 0; i < ids.length; i++) {
+                for (let j = i + 1; j < ids.length; j++)
+                    pairs.add(`${ids[i]}:${ids[j]}`);
+            }
+        }
+        return pairs;
+    }
+
+    _survivingPairs(pairs, alive) {
+        const kept = new Set();
+        for (const p of pairs) {
+            const [a, b] = p.split(':');
+            if (alive.has(Number(a)) && alive.has(Number(b))) kept.add(p);
+        }
+        return kept;
+    }
+
     // Prefer permutations where windows stay in the same column/shelf as last time.
     _groupStabilityBonus(tileResult) {
         if (!this._lastGroupAssignment) return 0;
 
-        let regrouped = 0;
-        let trackedCount = 0;
-        for (let levelIdx = 0; levelIdx < tileResult.levels.length; levelIdx++) {
-            for (const w of tileResult.levels[levelIdx].windows) {
-                const prevLevelIdx = this._lastGroupAssignment.get(w.id);
-                if (prevLevelIdx === undefined) continue;
-                trackedCount++;
-                if (prevLevelIdx !== levelIdx) regrouped++;
+        // Only windows on both sides can regroup; charging a newcomer's pairs makes the sparsest join cheapest.
+        const tracked = this._lastGroupAssignment.ids;
+        const alive = new Set(tileResult.levels
+            .flatMap(l => l.windows.map(w => w.id))
+            .filter(id => tracked.has(id)));
+        if (alive.size < 2) return 0;
+
+        const now = this._coMembershipPairs(tileResult.levels, alive);
+        // Nothing closed, so every recorded pair still has both ends and needs no filtering.
+        const prev = alive.size === tracked.size
+            ? this._lastGroupAssignment.pairs
+            : this._survivingPairs(this._lastGroupAssignment.pairs, alive);
+
+        let changed = 0;
+        for (const p of prev) if (!now.has(p)) changed++;
+        for (const p of now) if (!prev.has(p)) changed++;
+
+        // Both sets are subsets of the pairs over alive, so the clamp is just belt and braces.
+        const totalPairs = (alive.size * (alive.size - 1)) / 2;
+        return (1 - Math.min(1, changed / totalPairs)) * GROUP_STABILITY_WEIGHT;
+    }
+
+    _scoreOrder(perm, workArea, place, currentIds) {
+        const result = place.call(this, perm, workArea, constants.WINDOW_SPACING);
+        const score = this._scoreLayout(result, workArea);
+        const fits = !result.overflow;
+
+        // Displacement is well defined whether or not the layout fits. Gate this on fits and an
+        // all-overflowing pool ties at zero, handing the pick to whatever the scan reaches first.
+        const position = this._positionStabilityBonus(result, workArea);
+        const group = this._groupStabilityBonus(result);
+        const sameOrder = perm.length === currentIds.length &&
+            perm.every((w, i) => w.id === currentIds[i]);
+
+        return { score, position, group, sameOrder, fits };
+    }
+
+    // Whether `windows` is the exact set the last real pass tiled. Orientation is written on
+    // every real pass regardless of ranking, so this is what _orientationFor trusts; settling
+    // additionally requires ranking, since only a ranked pass leaves an order worth keeping.
+    _sameWindowSetAsLastPass(windows) {
+        const tiled = this._lastGroupAssignment?.ids;
+        return !!tiled && windows.every(w => tiled.has(w.id));
+    }
+
+    // Everyone on screen was already tiled, so this pass is a miniaturize, a restore or a resize:
+    // the layout is settling, not being built. A newcomer means the opposite. An unranked last
+    // pass (fit check, drag) never earns settling either, or its leftover order gets trusted.
+    _layoutIsSettling(windows) {
+        return this._lastTileRanked && this._sameWindowSetAsLastPass(windows);
+    }
+
+    // The band hangs off the tightest layout on offer, not off a running best: chained in-band
+    // hops walk the pick downhill and make it depend on the scan order. A settling pass skips
+    // the filter outright: two orders inside the same shape can differ by far more than any
+    // band worth keeping, and _beatsCandidate already carries density as its last tiebreak.
+    _bandFinalists(pool, settling) {
+        const scored = pool.filter(s => s.score);
+        if (settling) return scored.length ? scored : pool;
+
+        const tightest = scored.length
+            ? Math.min(...scored.map(s => s.score.density)) : Infinity;
+        const band = scored.filter(s => s.score.density <= tightest);
+        // Nothing scored because nothing fit, so stability decides on its own like before.
+        return band.length ? band : pool;
+    }
+
+    // Stability ranks in tiers, never as one sum: co-membership jumps in steps of a third of its
+    // weight while displacement spans a few points, so summed it always dictated the layout.
+    // meanPair and centralization only exist because a maximum ties easily, and without a
+    // tiebreak the pick would depend on the scan order again.
+    _beatsCandidate(candidate, best) {
+        if (candidate.position !== best.position) return candidate.position > best.position;
+        if (candidate.group !== best.group) return candidate.group > best.group;
+        if (candidate.sameOrder !== best.sameOrder) return candidate.sameOrder;
+        if (!candidate.score || !best.score) return false;
+        if (candidate.score.meanPair !== best.score.meanPair)
+            return candidate.score.meanPair < best.score.meanPair;
+        return candidate.score.centralization > best.score.centralization;
+    }
+
+    // Whole orders only, and the same cut on every run: an order scored on some of its shapes
+    // competes on a subset nobody chose, and a wall-clock cut lands somewhere different each
+    // time the shell is busy. Preserving orders come first, so a cut keeps them.
+    _scoreCandidates(orders, placers, workArea, currentIds) {
+        const scored = [];
+        for (const perm of orders) {
+            if (scored.length > 0 &&
+                scored.length + placers.length > constants.LAYOUT_SEARCH_CANDIDATE_BUDGET) break;
+            for (const place of placers)
+                scored.push({ perm, place, ...this._scoreOrder(perm, workArea, place, currentIds) });
+        }
+        return scored;
+    }
+
+    // From six windows up the pool is nothing but global re-sorts, which reshuffle by
+    // construction, so the stability terms score with nothing to preserve.
+    _preservingCandidates(windows) {
+        if (!this._lastTiledOrder) return [];
+
+        const byId = new Map(windows.map(w => [w.id, w]));
+        const kept = this._lastTiledOrder.filter(id => byId.has(id)).map(id => byId.get(id));
+        const known = new Set(this._lastTiledOrder);
+        const newcomers = windows.filter(w => !known.has(w.id));
+
+        if (newcomers.length === 0) return [kept];
+
+        const out = [];
+        for (let i = 0; i <= kept.length; i++) {
+            const order = [...kept];
+            order.splice(i, 0, ...newcomers);
+            out.push(order);
+        }
+        return out;
+    }
+
+    // A simulation reads back nothing but whether the set fits, and the smart-resize loop runs one
+    // per shrink step. Same scan and budget as the ranked search, or the two disagree on what fits.
+    _findFittingLayout(windows, workArea, placers) {
+        const orders = [...this._preservingCandidates(windows), ...this._generatePermutations(windows)];
+        let fallback = null;
+        let scanned = 0;
+
+        for (const perm of orders) {
+            if (scanned > 0 &&
+                scanned + placers.length > constants.LAYOUT_SEARCH_CANDIDATE_BUDGET) break;
+            for (const place of placers) {
+                scanned++;
+                if (!place.call(this, perm, workArea, constants.WINDOW_SPACING).overflow)
+                    return { order: perm, place };
+                fallback ??= { order: perm, place };
             }
         }
-        if (trackedCount === 0) return 0;
 
-        const regroupedFraction = regrouped / trackedCount;
-        return (1 - regroupedFraction) * GROUP_STABILITY_WEIGHT;
+        return fallback ?? { order: windows, place: placers[0] };
     }
 
-    // Distance from the restored window's center to the slot its miniature held (Infinity if absent).
-    _restoreDisplacement(tileResult) {
-        if (!this._restoreAnchor) return 0;
-        for (const level of tileResult.levels) {
-            for (const w of level.windows) {
-                if (w.id !== this._restoreAnchor.id) continue;
-                const px = (w.targetX ?? level.x) + w.width / 2;
-                const py = (w.targetY ?? level.y) + w.height / 2;
-                return Math.hypot(px - this._restoreAnchor.cx, py - this._restoreAnchor.cy);
-            }
-        }
-        return Infinity;
-    }
-
-    _scoreOrder(perm, workArea, tilingFn, currentIds) {
-        const result = tilingFn.call(this, perm, workArea, constants.WINDOW_SPACING);
-        let score = this._scoreLayout(result, workArea);
-        const fits = score > -Infinity;
-
-        // Prefer current order (+5) to avoid unnecessary visual swaps
-        if (fits) {
-            const isSameOrder = perm.length === currentIds.length &&
-                perm.every((w, i) => w.id === currentIds[i]);
-            if (isSameOrder) score += 5;
-        }
-
-        // A just-restored window makes proximity the primary pick, with the base score breaking ties inside the tolerance bucket.
-        const bucket = this._restoreAnchor
-            ? Math.round(this._restoreDisplacement(result) / constants.RESTORE_PROXIMITY_TOLERANCE_PX)
-            : 0;
-
-        return { score, bucket, fits };
-    }
-
-    _findOptimalOrder(windows, workArea, tilingFn) {
-        if (windows.length <= 1) return windows;
+    _findOptimalLayout(windows, workArea, placers) {
+        if (windows.length <= 1) return { order: windows, place: placers[0] };
 
         const startTime = monotonicNow();
-        const permutations = this._generatePermutations(windows);
+        // Preservers go first so a budget cut falls back to the previous order instead of
+        // wherever the scan happened to stop.
+        const orders = [...this._preservingCandidates(windows), ...this._generatePermutations(windows)];
         const currentIds = this._lastTiledOrder ?? windows.map(w => w.id);
+        const scored = this._scoreCandidates(orders, placers, workArea, currentIds);
 
-        let bestOrder = windows;
-        let bestScore = -Infinity;
-        let bestBucket = Infinity;
-        let bestFits = false;
+        // An overflowing pick lands out of bounds and Mutter clamps it onto its neighbor, so
+        // anything that fits outranks everything else.
+        const fitting = scored.filter(s => s.fits);
+        const pool = fitting.length > 0 ? fitting : scored;
 
-        for (const perm of permutations) {
-            const { score, bucket, fits } = this._scoreOrder(perm, workArea, tilingFn, currentIds);
+        const settling = this._layoutIsSettling(windows);
+        const finalists = this._bandFinalists(pool, settling);
 
-            // Proximity outranks the score, but never a fitting layout: an overflowing pick lands out of bounds and Mutter clamps it onto its neighbor.
-            const isBetter = fits !== bestFits
-                ? fits
-                : (bucket < bestBucket || (bucket === bestBucket && score > bestScore));
-
-            if (isBetter) {
-                bestFits = fits;
-                bestBucket = bucket;
-                bestScore = score;
-                bestOrder = perm;
-            }
+        let best = null;
+        for (const s of finalists) {
+            if (!best || this._beatsCandidate(s, best)) best = s;
         }
 
         const elapsed = Math.round(monotonicNow() - startTime);
-        Logger.log(`_findOptimalOrder: ${windows.length} windows, ${permutations.length} permutations, ${elapsed}ms${this._restoreAnchor ? ` (restore anchor ${this._restoreAnchor.id})` : ''}`);
+        Logger.log(`_findOptimalLayout: ${windows.length} windows, ${orders.length} orders x ${placers.length} placers, ${scored.length} scored, ${settling ? 'settling' : 'packing'}, ${elapsed}ms${this._restoreAnchor ? ` (restore anchor ${this._restoreAnchor.id})` : ''}`);
 
-        return bestOrder;
+        return best ? { order: best.perm, place: best.place } : { order: windows, place: placers[0] };
     }
 
     // Order-sensitive hash: different input orders must never share a cache entry.
@@ -952,7 +1134,7 @@ export const TilingManager = GObject.registerClass({
         }
 
         const spacing = constants.WINDOW_SPACING;
-        const useVerticalShelves = this._useVerticalForDrag(windows, work_area);
+        const useVerticalShelves = this._orientationFor(windows, work_area);
         const tilingFn = useVerticalShelves ? this._verticalShelves : this._horizontalShelves;
 
         const forced = this._tryForcedShape(windows, work_area, spacing, useVerticalShelves, isSimulation, hash);
@@ -975,6 +1157,10 @@ export const TilingManager = GObject.registerClass({
     // second pass in the other orientation before paying that.
     _tryOppositeOrientation(windows, work_area, spacing, tilingFn, useVerticalShelves, isSimulation, primary) {
         if (this.isDragging && !isSimulation) return primary;
+        // A packing search competes both orientations in one pass, so there is no other side to
+        // try and rerunning it here just pays for the same candidates twice.
+        if (primary.orderOptimized && windows.length > 2 && !this._layoutIsSettling(windows))
+            return primary;
 
         const altVertical = !useVerticalShelves;
         const altFn = altVertical ? this._verticalShelves : this._horizontalShelves;
@@ -986,14 +1172,50 @@ export const TilingManager = GObject.registerClass({
 
         // The alt pass wrote its own targets onto the descriptors, and the preferred result's
         // levels point at those same objects, so replay it before handing it back.
-        return tilingFn.call(this, primary.windows, work_area, spacing);
+        const replay = primary.recipe
+            ? primary.recipe.place.call(this, primary.recipe.order, work_area, spacing)
+            : tilingFn.call(this, primary.windows, work_area, spacing);
+        replay.orderOptimized = primary.orderOptimized;
+        replay.recipe = primary.recipe;
+        return replay;
     }
 
     // Skip cache during drag (order changes but hash doesn't) and while a pin is active, since
     // the hash ignores shape so a new pin would hit a stale cached layout and revert.
     _isTileCacheHit(hash, isSimulation) {
-        return this._cachedTileResult && this._lastLayoutHash === hash &&
-            !isSimulation && !this.isDragging && !this._activePinnedShape;
+        if (!this._cachedTileResult || this._lastLayoutHash !== hash) return false;
+        if (isSimulation || this.isDragging || this._activePinnedShape) return false;
+
+        // The hash covers ids and sizes, not how hard we looked for an order. Without this the
+        // fit check, which runs first and can't rank, gets to decide the layout for good.
+        return this._cachedTileResult.orderOptimized === true ||
+            !this._ranksOrders(this._cachedTileResult.overflow, isSimulation);
+    }
+
+    // The pin fixes the composition, not who sits in which cell. Taking the descriptor list as
+    // the order lets a window swap sides with its neighbor the moment it miniaturizes. Placed on
+    // the stored axis, not useVerticalShelves: see _orientationFor for why the fresh value can't
+    // be trusted right after a pin's own "stable order" placement.
+    _placePinnedShape(windows, work_area, spacing, useVerticalShelves, isSimulation) {
+        const shape = this._activePinnedShape;
+        const vertical = this._activePinnedVertical ?? useVerticalShelves;
+        const place = (order, area, sp) => this._placeByShape(order, area, sp, shape, vertical);
+        const literal = place(windows, work_area, spacing);
+        if (literal.overflow) return literal;
+
+        // Reranking cells right after a drop moves the window the drag just placed, so the order
+        // only opens up once a size changes; a miniaturize is what the ranking is there for.
+        if (this._pinnedSizesUnchanged || !this._ranksOrders(false, isSimulation)) {
+            Logger.log(`_tile: ${windows.length} windows honoring pinned shape [${shape.join(',')}] (stable order)`);
+            return literal;
+        }
+
+        const winner = this._findOptimalLayout(windows, work_area, [place]);
+        const ranked = winner.place(winner.order, work_area, spacing);
+        ranked.recipe = winner;
+        ranked.orderOptimized = true;
+        Logger.log(`_tile: ${windows.length} windows honoring pinned shape [${shape.join(',')}] (ranked order)`);
+        return ranked;
     }
 
     // A pinned composition or an in-flight drag hint wins over the auto-chosen grid, but only
@@ -1001,14 +1223,8 @@ export const TilingManager = GObject.registerClass({
     // overflow -> miniaturization still runs. Returns the forced layout, or null to continue.
     _tryForcedShape(windows, work_area, spacing, useVerticalShelves, isSimulation, hash) {
         if (this._activePinnedShape && !isSimulation && !this.isDragging) {
-            const pinned = this._placeByShape(windows, work_area, spacing, this._activePinnedShape, useVerticalShelves);
-            if (!pinned.overflow) {
-                this._lastLayoutHash = hash;
-                this._cachedTileResult = pinned;
-                Logger.log(`_tile: ${windows.length} windows honoring pinned shape [${this._activePinnedShape.join(',')}]`);
-                return pinned;
-            }
-            Logger.log('_tile: pinned shape overflows, dropping to auto-layout');
+            const pinned = this._tryPin(windows, work_area, spacing, useVerticalShelves, isSimulation, hash);
+            if (pinned) return pinned;
         }
 
         if (this._dragLayoutHint?.shape && this.isDragging && !isSimulation) {
@@ -1023,25 +1239,190 @@ export const TilingManager = GObject.registerClass({
         return null;
     }
 
+    // Applies the active pin, clearing its overflow grace timer on success or handing it to
+    // _dropPinAfterGrace on failure. Returns the placed layout, or null to fall through.
+    _tryPin(windows, work_area, spacing, useVerticalShelves, isSimulation, hash) {
+        const pinned = this._placePinnedShape(windows, work_area, spacing, useVerticalShelves, isSimulation);
+        const pin = this._pinnedComposition.get(this._activePinnedWorkspace);
+        if (!pinned.overflow) {
+            if (pin) pin.overflowSince = null;
+            this._lastLayoutHash = hash;
+            this._cachedTileResult = pinned;
+            return pinned;
+        }
+        this._dropPinAfterGrace(pin);
+        this._activePinnedShape = null;
+        this._activePinnedVertical = null;
+        return null;
+    }
+
+    // A frame mid-Wayland-negotiation can overflow for a moment without the shape being truly
+    // dead, so give it PIN_OVERFLOW_GRACE_MS before dropping it for good.
+    _dropPinAfterGrace(pin) {
+        if (!pin) return;
+        pin.overflowSince ??= monotonicNow();
+        if (monotonicNow() - pin.overflowSince < constants.PIN_OVERFLOW_GRACE_MS) {
+            Logger.log('_tile: pinned shape overflows, holding grace period');
+            return;
+        }
+        this._pinnedComposition.delete(this._activePinnedWorkspace);
+        Logger.log('_tile: pinned shape overflows, dropping it');
+    }
+
+    // Simulations (binary-search in tryFitWithResize) skip stability scoring for performance.
+    // canFitWindow runs before _prepareTilePass takes the snapshot, so it ranks nothing either.
+    _ranksOrders(overflow, isSimulation) {
+        return overflow || (!!this._positionSnapshot && !isSimulation);
+    }
+
     _chooseTileResult(windows, work_area, spacing, tilingFn, useVerticalShelves, isSimulation) {
         const currentResult = tilingFn.call(this, windows, work_area, spacing);
+        const wantOptimal = this._ranksOrders(currentResult.overflow, isSimulation);
 
-        // Simulations (binary-search in tryFitWithResize) skip stability scoring for performance.
-        const shouldOptimize = currentResult.overflow || (this._positionSnapshot && !isSimulation);
-
-        if (!shouldOptimize) {
-            Logger.log(`_tile: ${windows.length} windows, vertical=${useVerticalShelves}, stable order`);
-            return currentResult;
-        }
-        if (this.isDragging && !isSimulation) {
-            Logger.log(`_tile: ${windows.length} windows, vertical=${useVerticalShelves}, overflow (drag, no permute)`);
+        if (!wantOptimal || (this.isDragging && !isSimulation)) {
+            const reason = wantOptimal ? 'overflow (drag, no permute)' : 'stable order';
+            Logger.log(`_tile: ${windows.length} windows, vertical=${useVerticalShelves}, ${reason}`);
+            currentResult.orderOptimized = false;
             return currentResult;
         }
 
-        const optimalWindows = this._findOptimalOrder(windows, work_area, tilingFn);
-        const result = tilingFn.call(this, optimalWindows, work_area, spacing);
+        const settling = this._layoutIsSettling(windows);
+        const held = this._tryFrozenShape(windows, work_area, spacing, useVerticalShelves, settling, isSimulation);
+        if (held) return held;
+
+        const placers = this._placersFor(tilingFn, useVerticalShelves, windows.length, settling);
+        const winner = isSimulation && windows.length > 1
+            ? this._findFittingLayout(windows, work_area, placers)
+            : this._findOptimalLayout(windows, work_area, placers);
+        // Scoring a candidate writes targetX/targetY onto the shared descriptors, so the
+        // winner has to be the last one placed.
+        const result = winner.place.call(this, winner.order, work_area, spacing);
         Logger.log(`_tile: ${windows.length} windows, vertical=${useVerticalShelves}, ${currentResult.overflow ? 'reordered (overflow fallback)' : 'stability-checked'}`);
+        result.recipe = winner;
+        result.orderOptimized = true;
         return result;
+    }
+
+    // A settling pass almost always keeps its shape, so trying it alone first skips scoring the
+    // whole shelf-placer pool for nothing. Returning null just means the caller's full pool runs
+    // next, so a shape that stopped fitting still repacks.
+    _tryFrozenShape(windows, work_area, spacing, useVerticalShelves, settling, isSimulation) {
+        // _placersFor never searches below 3 windows, so there is no shape to freeze; a
+        // simulation only cares whether something fits, not which order produced it.
+        if (!settling || isSimulation || windows.length <= 2) return null;
+
+        const placers = this._shapePreservingPlacers(useVerticalShelves, windows.length);
+        if (!placers.length) return null;
+
+        const winner = this._findOptimalLayout(windows, work_area, placers);
+        const result = winner.place.call(this, winner.order, work_area, spacing);
+        if (result.overflow) return null;
+
+        Logger.log(`_tile: ${windows.length} windows, vertical=${useVerticalShelves}, shape held`);
+        result.recipe = winner;
+        result.orderOptimized = true;
+        return result;
+    }
+
+    // Vertical shelves has two packings to offer (rows on or off); horizontal offers one
+    // placer per row count, since each is a differently-shaped candidate to score.
+    _shelfPlacers(useVerticalShelves, windowCount) {
+        if (useVerticalShelves) {
+            return [
+                (order, area, sp) => this._verticalShelvesWith(order, area, sp, false),
+                (order, area, sp) => this._verticalShelvesWith(order, area, sp, true),
+            ];
+        }
+
+        const placers = [];
+        for (let rows = 1; rows <= windowCount; rows++) {
+            for (const perRow of this._rowSplitVariants(this._distributeWindowsPerRow(windowCount, rows)))
+                placers.push((order, area, sp) => this._horizontalShelvesWith(order, area, sp, perRow));
+        }
+        return placers;
+    }
+
+    // Miniaturizing shrinks the tallest window, which is exactly what the heuristic reads, so
+    // letting it speak on every pass flips rows into columns and back mid-cycle. Trusts the last
+    // real orientation whenever the window set matches, not only while _layoutIsSettling: a pin's
+    // "stable order" placement never ranks (by design, to skip re-ranking right after a drop), so
+    // gating on settling here starved every caller of an orientation just verified to fit, not
+    // only the pin's own.
+    _orientationFor(windows, workArea) {
+        if (this._lastTiledVertical !== null && this._sameWindowSetAsLastPass(windows))
+            return this._lastTiledVertical;
+        return this._useVerticalForDrag(windows, workArea);
+    }
+
+    // Both orientations hand back their exact split from the last pass, so _chooseTileResult can
+    // try it alone before opening the density fight. A close leaves a shape that no longer
+    // matches the set, hence the slot count check.
+    _shapePreservingPlacers(useVerticalShelves, windowCount) {
+        if (useVerticalShelves) {
+            const shape = this._lastTiledShape;
+            if (!shape) return [];
+            const slots = shape.reduce((s, col) => s + col.reduce((t, n) => t + n, 0), 0);
+            if (slots !== windowCount) return [];
+            return [(order, area, sp) => this._verticalShelvesFixed(order, area, sp, shape)];
+        }
+
+        const rowCounts = this._lastTiledRowCounts;
+        if (!rowCounts) return [];
+        if (rowCounts.reduce((a, b) => a + b, 0) !== windowCount) return [];
+        return [(order, area, sp) => this._horizontalShelvesWith(order, area, sp, rowCounts)];
+    }
+
+    // A settling set competes only inside the shapes of the orientation it already has; a
+    // newcomer gets both, since that is the one pass that picks the arrangement from scratch.
+    _placersFor(tilingFn, useVerticalShelves, windowCount, settling) {
+        // One or two windows have a fixed arrangement, so there is no row count to choose.
+        if (windowCount <= 2) return [tilingFn];
+        if (settling) {
+            return [...this._shapePreservingPlacers(useVerticalShelves, windowCount),
+                ...this._shelfPlacers(useVerticalShelves, windowCount)];
+        }
+        return [...this._shelfPlacers(false, windowCount), ...this._shelfPlacers(true, windowCount)];
+    }
+
+    _finishColumnLayout({ levels, totalWidth, overflow }, windows, work_area, spacing) {
+        const startX = Math.max(work_area.x, (work_area.width - totalWidth) / 2 + work_area.x);
+        this._positionColumnWindows(levels, work_area, spacing, startX);
+        return { x: startX, y: work_area.y, overflow, vertical: true, levels, windows };
+    }
+
+    _verticalShelvesWith(windows, work_area, spacing, allowRows) {
+        if (windows.length <= 2) return this._simpleCenteredColumn(windows, work_area, spacing);
+        const columns = this._binPackColumns(windows, work_area, spacing, allowRows);
+        return this._finishColumnLayout(this._buildColumnLevels(columns, work_area, spacing),
+            windows, work_area, spacing);
+    }
+
+    // The greedy packer re-decides every column as soon as a window changes size, so replaying the
+    // previous order gives back a different arrangement, and the layout on screen never gets
+    // offered back to the search. Hence a recorded shape to fill instead of one to pack into.
+    _verticalShelvesFixed(windows, work_area, spacing, shape) {
+        const columns = [];
+        let next = 0;
+
+        for (const rowSizes of shape) {
+            const col = { rows: [], height: 0, width: 0 };
+            for (const size of rowSizes) {
+                const row = { windows: [], used: 0, height: 0 };
+                for (let k = 0; k < size; k++) {
+                    const w = windows[next++];
+                    row.windows.push(w);
+                    row.used += (row.windows.length > 1 ? spacing : 0) + w.width;
+                    row.height = Math.max(row.height, w.height);
+                }
+                col.height += (col.rows.length > 0 ? spacing : 0) + row.height;
+                col.width = Math.max(col.width, row.used);
+                col.rows.push(row);
+            }
+            columns.push(col);
+        }
+
+        return this._finishColumnLayout(this._buildColumnLevels(columns, work_area, spacing),
+            windows, work_area, spacing);
     }
 
     _verticalShelves(windows, work_area, spacing) {
@@ -1049,56 +1430,81 @@ export const TilingManager = GObject.registerClass({
             return this._simpleCenteredColumn(windows, work_area, spacing);
         }
 
-        const columns = this._binPackColumns(windows, work_area, spacing);
-        const { levels, totalWidth, overflow } = this._buildColumnLevels(columns, work_area, spacing);
+        // First-fit is greedy, so a free row join can starve a later window of the column it
+        // needed. Packing both ways and keeping the tighter box means rows only ever win.
+        const packings = [false, true].map(allowRows => {
+            const columns = this._binPackColumns(windows, work_area, spacing, allowRows);
+            return this._buildColumnLevels(columns, work_area, spacing);
+        });
 
-        const startX = Math.max(work_area.x, (work_area.width - totalWidth) / 2 + work_area.x);
-        this._positionColumnWindows(levels, work_area, spacing, startX);
-
-        return {
-            x: startX,
-            y: work_area.y,
-            overflow: overflow,
-            vertical: true,
-            levels: levels,
-            windows: windows
-        };
+        return this._finishColumnLayout(this._tighterPacking(packings), windows, work_area, spacing);
     }
 
     // Bin packing without height sorting to preserve swap order. A window that fits no column
     // opens a new one, or (when there's no width left) is forced into the shortest column.
-    _binPackColumns(windows, work_area, spacing) {
+    _binPackColumns(windows, work_area, spacing, allowRows) {
         const columns = [];
 
         for (const w of windows) {
-            let placed = false;
-
-            for (const col of columns) {
-                const newHeight = col.height + (col.height > 0 ? spacing : 0) + w.height;
-                if (newHeight <= work_area.height) {
-                    col.windows.push(w);
-                    col.height = newHeight;
-                    col.width = Math.max(col.width, w.width);
-                    placed = true;
-                    break;
-                }
-            }
-            if (placed) continue;
+            if (this._placeInExistingColumn(columns, w, work_area, spacing, allowRows)) continue;
 
             const totalWidth = columns.reduce((s, c) => s + c.width, 0) +
                                (columns.length > 0 ? columns.length * spacing : 0) + w.width;
 
             if (totalWidth <= work_area.width || columns.length === 0) {
-                columns.push({ windows: [w], height: w.height, width: w.width });
+                const col = { rows: [], height: 0, width: 0 };
+                this._openRow(col, w, spacing);
+                columns.push(col);
             } else {
-                this._forceIntoShortestColumn(columns, w, spacing);
+                this._forceIntoShortestColumn(columns, w, spacing, allowRows);
             }
         }
 
         return columns;
     }
 
-    _forceIntoShortestColumn(columns, w, spacing) {
+    _placeInExistingColumn(columns, w, work_area, spacing, allowRows) {
+        // A join is free while some other column is already taller, but once it makes this one
+        // the tallest, the box grows more in height than a new column would cost in width.
+        const tallest = columns.reduce((h, c) => Math.max(h, c.height), 0);
+
+        for (const col of columns) {
+            if (allowRows && this._joinRow(col, w, spacing, tallest)) return true;
+
+            if (col.height + spacing + w.height <= work_area.height) {
+                this._openRow(col, w, spacing);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Never widening the column is the whole difference between this and a free 2D packer: the
+    // layout stays a shelf model while two miniatures share the vertical space one normal
+    // window would have taken alone.
+    _joinRow(col, w, spacing, maxHeight) {
+        for (const row of col.rows) {
+            if (row.used + spacing + w.width > col.width) continue;
+
+            const grown = Math.max(row.height, w.height);
+            if (col.height - row.height + grown > maxHeight) continue;
+
+            col.height += grown - row.height;
+            row.height = grown;
+            row.used += spacing + w.width;
+            row.windows.push(w);
+            return true;
+        }
+        return false;
+    }
+
+    _openRow(col, w, spacing) {
+        col.height += (col.rows.length > 0 ? spacing : 0) + w.height;
+        col.width = Math.max(col.width, w.width);
+        col.rows.push({ windows: [w], used: w.width, height: w.height });
+    }
+
+    _forceIntoShortestColumn(columns, w, spacing, allowRows) {
         let bestCol = columns[0];
         let minHeight = columns[0].height;
         for (const col of columns) {
@@ -1107,9 +1513,21 @@ export const TilingManager = GObject.registerClass({
                 bestCol = col;
             }
         }
-        bestCol.windows.push(w);
-        bestCol.height += spacing + w.height;
-        bestCol.width = Math.max(bestCol.width, w.width);
+        // The height budget is already blown, so only the never-widen rule still has a say.
+        if (!allowRows || !this._joinRow(bestCol, w, spacing, Infinity))
+            this._openRow(bestCol, w, spacing);
+    }
+
+    // Ties keep the row-free packing, so a layout only ever changes when rows genuinely shrink it.
+    _tighterPacking([plain, rows]) {
+        if (plain.overflow !== rows.overflow)
+            return plain.overflow ? rows : plain;
+
+        return this._packingArea(rows) < this._packingArea(plain) ? rows : plain;
+    }
+
+    _packingArea({ levels, totalWidth }) {
+        return totalWidth * levels.reduce((h, lv) => Math.max(h, lv.height), 0);
     }
 
     _buildColumnLevels(columns, work_area, spacing) {
@@ -1122,13 +1540,15 @@ export const TilingManager = GObject.registerClass({
             const level = new Level(work_area);
 
             let colHeight = 0;
-            for (const w of col.windows) {
-                level.windows.push(w);
+            for (const row of col.rows) {
                 if (colHeight > 0) colHeight += spacing;
-                colHeight += w.height;
-                level.width = Math.max(level.width, w.width);
+                colHeight += row.height;
+                level.width = Math.max(level.width, row.used);
+                for (const w of row.windows)
+                    level.windows.push(w);
             }
             level.height = colHeight;
+            level.rows = col.rows;
 
             if (level.height > work_area.height) {
                 overflow = true;
@@ -1149,47 +1569,113 @@ export const TilingManager = GObject.registerClass({
         return { levels, totalWidth, overflow };
     }
 
-    // Columns fan out from center: those left of center right-align, those right left-align, so
-    // the gap always falls on the outer edges rather than between neighbours.
+    // Columns fan in toward each other: the first pulls right, the last pulls left, so the gap
+    // always falls on the outer edges rather than between neighbors. A row leans the same way
+    // inside its column, and a short window inside its row.
     _positionColumnWindows(levels, work_area, spacing, startX) {
-        const levelCount = levels.length;
-        const centerColIndex = (levelCount - 1) / 2;
+        const originX = work_area.x + work_area.width / 2;
+        const originY = work_area.y + work_area.height / 2;
 
         let xPos = startX;
-        for (let colIdx = 0; colIdx < levelCount; colIdx++) {
-            const level = levels[colIdx];
+        for (const [c, level] of levels.entries()) {
             level.x = xPos;
+            const leanX = neighborOrigin(xPos, level.width, c, levels.length, originX);
 
-            let alignMode = 'center';
-            if (levelCount > 1) {
-                if (colIdx < centerColIndex) {
-                    alignMode = 'right';
-                } else if (colIdx > centerColIndex) {
-                    alignMode = 'left';
+            let yPos = Math.max(work_area.y, (work_area.height - level.height) / 2 + work_area.y);
+
+            for (const [r, row] of level.rows.entries()) {
+                let rowX = xPos + outwardOffset(xPos, level.width, row.used, leanX);
+                const leanY = neighborOrigin(yPos, row.height, r, level.rows.length, originY);
+
+                for (const win of row.windows) {
+                    win.targetX = rowX;
+                    win.targetY = yPos + outwardOffset(yPos, row.height, win.height, leanY);
+                    rowX += win.width + spacing;
                 }
-            }
 
-            let totalColHeight = 0;
-            for (const win of level.windows) {
-                totalColHeight += win.height;
-            }
-            totalColHeight += (level.windows.length - 1) * spacing;
-
-            let yPos = Math.max(work_area.y, (work_area.height - totalColHeight) / 2 + work_area.y);
-
-            for (const win of level.windows) {
-                if (alignMode === 'left') {
-                    win.targetX = xPos;
-                } else if (alignMode === 'right') {
-                    win.targetX = xPos + level.width - win.width;
-                } else {
-                    win.targetX = xPos + (level.width - win.width) / 2;
-                }
-                win.targetY = yPos;
-                yPos += win.height + spacing;
+                yPos += row.height + spacing;
             }
 
             xPos += level.width + spacing;
+        }
+
+        this._slideTowardNeighbors(levels.map(lv => lv.rows.map(r => r.windows)),
+            true, work_area, spacing);
+    }
+
+    // A level is as wide as its widest row, so a narrower row leaves a notch the next level never
+    // uses. Units that don't face each other across the axis can't collide, so each slides in whole
+    // (a row moves as one); the level ahead is the floor, since past it the mosaic collapses.
+    _slideTowardNeighbors(levelUnits, vertical, work_area, spacing) {
+        const boxes = levelUnits.map(units => units.map(u => this._unitBox(u, vertical)));
+        // Skip a single-unit level, or its own lead would floor itself and cancel every slide.
+        // For a multi-row level, this stops a row that shares no perpendicular overlap from
+        // sliding clean through into the neighbor level's slot and splitting its own column.
+        const levelFloors = boxes.map(units => units.length > 1
+            ? Math.min(...units.map(b => b.lead)) : -Infinity);
+        const placed = [];
+        let prevLead = null;
+        let recovered = 0;
+
+        for (const [l, units] of boxes.entries()) {
+            let levelLead = Infinity;
+            for (const [u, box] of units.entries()) {
+                const floor = Math.max(prevLead ?? box.lead, levelFloors[l]);
+                const slack = box.lead - this._slideFloor(box, placed, spacing, floor);
+                if (slack > 0) {
+                    recovered += slack;
+                    box.lead -= slack;
+                    box.end -= slack;
+                    for (const w of levelUnits[l][u]) {
+                        if (vertical) w.targetX -= slack;
+                        else w.targetY -= slack;
+                    }
+                }
+                levelLead = Math.min(levelLead, box.lead);
+            }
+            placed.push(...units);
+            prevLead = levelLead;
+        }
+
+        // Layouts that gained nothing have to come out byte identical, or every retile pays for
+        // a recentering it didn't need.
+        if (recovered > 0) this._recenterAlongAxis(levelUnits.flat(2), vertical, work_area);
+    }
+
+    _slideFloor(box, placed, spacing, floor) {
+        for (const p of placed) {
+            const apart = box.perpLo >= p.perpHi + spacing || p.perpLo >= box.perpHi + spacing;
+            if (!apart) floor = Math.max(floor, p.end + spacing);
+        }
+        return floor;
+    }
+
+    _unitBox(unit, vertical) {
+        const lead = w => (vertical ? w.targetX : w.targetY);
+        const perpLo = w => (vertical ? w.targetY : w.targetX);
+        return {
+            lead: Math.min(...unit.map(lead)),
+            end: Math.max(...unit.map(w => lead(w) + (vertical ? w.width : w.height))),
+            perpLo: Math.min(...unit.map(perpLo)),
+            perpHi: Math.max(...unit.map(w => perpLo(w) + (vertical ? w.height : w.width))),
+        };
+    }
+
+    // The mosaic has always been centered on the space it uses, and the slide above shrinks that.
+    _recenterAlongAxis(windows, vertical, work_area) {
+        const lead = w => (vertical ? w.targetX : w.targetY);
+        const size = w => (vertical ? w.width : w.height);
+        const start = vertical ? work_area.x : work_area.y;
+        const extent = vertical ? work_area.width : work_area.height;
+
+        const lo = Math.min(...windows.map(lead));
+        const hi = Math.max(...windows.map(w => lead(w) + size(w)));
+        if (hi - lo > extent) return;
+
+        const shift = start + (extent - (hi - lo)) / 2 - lo;
+        for (const w of windows) {
+            if (vertical) w.targetX += shift;
+            else w.targetY += shift;
         }
     }
 
@@ -1246,9 +1732,10 @@ export const TilingManager = GObject.registerClass({
         level.x = Math.max(work_area.x, (work_area.width - maxWidth) / 2 + work_area.x);
         level.y = Math.max(work_area.y, (work_area.height - totalHeight) / 2 + work_area.y);
 
+        const origin = work_area.x + work_area.width / 2;
         let yPos = level.y;
         for (const w of level.windows) {
-            w.targetX = level.x + (maxWidth - w.width) / 2;
+            w.targetX = level.x + outwardOffset(level.x, maxWidth, w.width, origin);
             w.targetY = yPos;
             yPos += w.height + spacing;
         }
@@ -1265,16 +1752,22 @@ export const TilingManager = GObject.registerClass({
         };
     }
 
+    // Non-search callers (drag, simulation, overflow fallback) never see the row-count search,
+    // so they still need one grid picked up front instead of a list of candidates.
     _horizontalShelves(windows, work_area, spacing) {
         if (windows.length <= 2) {
             return this._simpleCenteredRow(windows, work_area, spacing);
         }
-        const { rows: numRows, windowsPerRow } = this._calculateOptimalGrid(windows, work_area);
+        const { windowsPerRow } = this._calculateOptimalGrid(windows, work_area);
+        return this._horizontalShelvesWith(windows, work_area, spacing, windowsPerRow);
+    }
+
+    _horizontalShelvesWith(windows, work_area, spacing, windowsPerRow) {
         const { levels, totalHeight, overflow } =
-            this._buildShelfRows(windows, work_area, spacing, numRows, windowsPerRow);
+            this._buildShelfRows(windows, work_area, spacing, windowsPerRow.length, windowsPerRow);
 
         const y = Math.max(work_area.y, (work_area.height - totalHeight) / 2 + work_area.y);
-        this._positionShelfWindows(levels, y, spacing);
+        this._positionShelfWindows(levels, y, spacing, work_area);
 
         return {
             x: work_area.x,
@@ -1324,18 +1817,26 @@ export const TilingManager = GObject.registerClass({
         return { levels, totalHeight, overflow };
     }
 
-    _positionShelfWindows(levels, y, spacing) {
+    _positionShelfWindows(levels, y, spacing, work_area) {
+        const origin = work_area.y + work_area.height / 2;
         let levelY = y;
-        for (const level of levels) {
+        for (const [r, level] of levels.entries()) {
             level.y = levelY;
+            const lean = neighborOrigin(levelY, level.height, r, levels.length, origin);
             let xPos = level.x;
             for (const w of level.windows) {
                 w.targetX = xPos;
-                w.targetY = levelY + (level.height - w.height) / 2;
+                w.targetY = levelY + outwardOffset(levelY, level.height, w.height, lean);
                 xPos += w.width + spacing;
             }
             levelY += level.height + spacing;
         }
+
+        // One unit per shelf, not per window: sliding each window separately let a narrow one
+        // drift off its own shelf toward a neighbor while its shelf-mate stayed put, fragmenting
+        // the group without shrinking it (the shelf's footprint still follows its widest member).
+        this._slideTowardNeighbors(levels.map(lv => [lv.windows]),
+            false, work_area, spacing);
     }
 
     // Force windows into an explicit shape instead of the auto-chosen grid (drag/keyboard/pin).
@@ -1379,17 +1880,7 @@ export const TilingManager = GObject.registerClass({
         if (totalHeight > work_area.height) overflow = true;
 
         const y = Math.max(work_area.y, (work_area.height - totalHeight) / 2 + work_area.y);
-        let levelY = y;
-        for (const level of levels) {
-            level.y = levelY;
-            let xPos = level.x;
-            for (const w of level.windows) {
-                w.targetX = xPos;
-                w.targetY = levelY + (level.height - w.height) / 2;
-                xPos += w.width + spacing;
-            }
-            levelY += level.height + spacing;
-        }
+        this._positionShelfWindows(levels, y, spacing, work_area);
         return { x: work_area.x, y, overflow, vertical: false, levels, windows };
     }
 
@@ -1414,18 +1905,25 @@ export const TilingManager = GObject.registerClass({
         if (totalWidth > work_area.width) overflow = true;
 
         const x = Math.max(work_area.x, (work_area.width - totalWidth) / 2 + work_area.x);
+        const origin = work_area.x + work_area.width / 2;
         let levelX = x;
-        for (const level of levels) {
+        for (const [c, level] of levels.entries()) {
             level.x = levelX;
+            const lean = neighborOrigin(levelX, level.width, c, levels.length, origin);
             const colHeight = level.windows.reduce((s, w, i) => s + w.height + (i > 0 ? spacing : 0), 0);
             let yPos = Math.max(work_area.y, (work_area.height - colHeight) / 2 + work_area.y);
             for (const w of level.windows) {
-                w.targetX = levelX + (level.width - w.width) / 2;
+                w.targetX = levelX + outwardOffset(levelX, level.width, w.width, lean);
                 w.targetY = yPos;
                 yPos += w.height + spacing;
             }
             levelX += level.width + spacing;
         }
+        // One unit per column, not per window: sliding each window separately let a narrow one
+        // drift off its own column toward a neighbor while its column-mate stayed put, fragmenting
+        // the group without shrinking it (the column's footprint still follows its widest member).
+        this._slideTowardNeighbors(levels.map(lv => [lv.windows]),
+            true, work_area, spacing);
         return { x, y: work_area.y, overflow, vertical: true, levels, windows };
     }
 
@@ -1448,10 +1946,11 @@ export const TilingManager = GObject.registerClass({
         const y = Math.max(work_area.y, (work_area.height - maxHeight) / 2 + work_area.y);
         level.y = y;
 
+        const origin = work_area.y + work_area.height / 2;
         let xPos = level.x;
         for (const w of level.windows) {
             w.targetX = xPos;
-            w.targetY = y + (maxHeight - w.height) / 2;
+            w.targetY = y + outwardOffset(y, maxHeight, w.height, origin);
             xPos += w.width + spacing;
         }
 
@@ -1485,7 +1984,6 @@ export const TilingManager = GObject.registerClass({
 
             const aspectDiff = Math.abs(layoutWidth / layoutHeight - workspaceAspect);
             const emptySpaces = rows * cols - windowCount;
-            // Heavily penalize overflow
             const score = aspectDiff + emptySpaces * 0.3 + (overflow ? 1000 : 0);
 
             if (!overflow && bestOverflow) {
@@ -1499,6 +1997,14 @@ export const TilingManager = GObject.registerClass({
         }
 
         return { rows: bestRows, windowsPerRow: this._distributeWindowsPerRow(windowCount, bestRows) };
+    }
+
+    // The remainder always sinks to the lower rows, so three windows in two rows can only be
+    // 1 over 2. Mirroring puts the fuller row on top, next to a shrinking window's neighbors.
+    _rowSplitVariants(windowsPerRow) {
+        const mirrored = [...windowsPerRow].reverse();
+        if (mirrored.every((n, i) => n === windowsPerRow[i])) return [windowsPerRow];
+        return [windowsPerRow, mirrored];
     }
 
     // Spread the leftover windows outward from the center row, so an uneven grid stays
@@ -1628,7 +2134,7 @@ export const TilingManager = GObject.registerClass({
         };
     }
 
-    _drawTile(workspace, monitor, tile_info, work_area, meta_windows, dryRun = false, slotsOut = null, bounds = null) {
+    _drawTile(workspace, monitor, tile_info, meta_windows, dryRun = false, slotsOut = null, bounds = null) {
         const levels = tile_info.levels;
         const _x = tile_info.x;
         const _y = tile_info.y;
@@ -1636,7 +2142,7 @@ export const TilingManager = GObject.registerClass({
             let y = _y;
             for(const level of levels) {
                 Logger.log(`Drawing horizontal level at y=${y}, width=${level.width}, height=${level.height}`);
-                level.draw_horizontal(workspace, monitor, meta_windows, work_area, y, this.masks, this.isDragging, this._drawingManager, dryRun, slotsOut, bounds);
+                level.draw_horizontal(workspace, monitor, meta_windows, y, this.masks, this.isDragging, this._drawingManager, dryRun, slotsOut, bounds);
                 y += level.height + constants.WINDOW_SPACING;
             }
         } else {
@@ -1649,7 +2155,7 @@ export const TilingManager = GObject.registerClass({
         }
     }
 
-    _animateTileLayout(workspace, monitor, tile_info, work_area, meta_windows, draggedWindow = null, slotsOut = null) {
+    _animateTileLayout(workspace, monitor, tile_info, work_area, meta_windows, draggedWindow = null, slotsOut = null, bounds = null) {
         // Nothing below can place a window without the manager, so let _drawTile do it.
         if (!this._animationsManager) return false;
 
@@ -1661,6 +2167,7 @@ export const TilingManager = GObject.registerClass({
             resizingWindowId: this._animationsManager.getResizingWindowId(),
             pendingMiniIds: new Set((this._pendingMiniatureWindows ?? []).map(p => p.window.get_id())),
             slotsOut,
+            bounds,
             windowLayouts: [],
             miniLayouts: [],
             workspace,
@@ -1668,7 +2175,7 @@ export const TilingManager = GObject.registerClass({
         };
 
         if (!tile_info.vertical) {
-            this._placeHorizontalAnimated(tile_info, work_area, meta_windows, ctx);
+            this._placeHorizontalAnimated(tile_info, meta_windows, ctx);
         } else {
             this._placeVerticalAnimated(tile_info, meta_windows, ctx);
         }
@@ -1679,18 +2186,16 @@ export const TilingManager = GObject.registerClass({
         return true;
     }
 
-    _placeHorizontalAnimated(tile_info, work_area, meta_windows, ctx) {
+    _placeHorizontalAnimated(tile_info, meta_windows, ctx) {
         let y = tile_info.y;
         for (const level of tile_info.levels) {
             let x = level.x;
             for (const windowDesc of level.windows) {
-                const center_offset = (work_area.height / 2 + work_area.y) - (y + windowDesc.height / 2);
-                let y_offset = 0;
-                if (center_offset > 0)
-                    y_offset = Math.min(center_offset, level.height - windowDesc.height);
+                const targetX = windowDesc.targetX !== undefined ? windowDesc.targetX : x;
+                const targetY = windowDesc.targetY !== undefined ? windowDesc.targetY : y;
 
                 const window = meta_windows.find(w => w.get_id() === windowDesc.id);
-                if (window) this._placeAnimatedWindow(window, windowDesc, x, y + y_offset, 'H', ctx);
+                if (window) this._placeAnimatedWindow(window, windowDesc, targetX, targetY, 'H', ctx);
                 x += windowDesc.width + constants.WINDOW_SPACING;
             }
             y += level.height + constants.WINDOW_SPACING;
@@ -1716,6 +2221,11 @@ export const TilingManager = GObject.registerClass({
     // Sort one window into how this pass treats it: miniature (actor transform), grabbed/resizing
     // (leave it to the cursor), pending-mini/grabbed (claim slot, don't animate), or normal (animate).
     _placeAnimatedWindow(window, windowDesc, tx, ty, orient, ctx) {
+        // The sibling path gets this clamp from Mutter itself, which never honours an out-of-area
+        // move_resize_frame. Miniatures ride on an actor transform, which Mutter does not police,
+        // so a packed column taller than the work area walks them off the bottom edge.
+        ({ x: tx, y: ty } = clampToWorkArea(tx, ty, windowDesc.width, windowDesc.height, ctx.bounds));
+
         const slot = { x: tx, y: ty, width: windowDesc.width, height: windowDesc.height };
 
         if (WindowState.get(window, IS_MINIATURE)) {
@@ -1924,6 +2434,44 @@ export const TilingManager = GObject.registerClass({
             Logger.error(`Overflow move failed for ref window: ${e}`));
     }
 
+    // Keep where everyone stood before this pass shrinks someone. The restore that undoes it
+    // needs that layout to aim at; the shrunken one only exists because of the shrink.
+    _rememberLayoutBeforeShrink() {
+        if (!this._settledSnapshot()) return;
+        for (const { window: w } of this._pendingMiniatureWindows ?? []) {
+            if (WindowState.get(w, IS_MINIATURE) || WindowState.get(w, 'layoutBeforeShrink'))
+                continue;
+            WindowState.set(w, 'layoutBeforeShrink', new Map(this._positionSnapshot));
+        }
+    }
+
+    // Frames are read before this pass runs, so on the pass that first tiles a new window they
+    // still hold the arrangement of the older, smaller set. Remembering that would let a later
+    // restore resurrect a layout the current windows never had.
+    _settledSnapshot() {
+        const tiled = this._lastGroupAssignment?.ids;
+        if (!tiled || tiled.size !== this._positionSnapshot.size) return false;
+        for (const id of this._positionSnapshot.keys()) {
+            if (!tiled.has(id)) return false;
+        }
+        return true;
+    }
+
+    // Windows that came and went since the shrink keep their live position, so a remembered
+    // layout never resurrects a slot the current set has no window for.
+    _adoptLayoutBeforeShrink(window) {
+        const remembered = WindowState.get(window, 'layoutBeforeShrink');
+        if (!remembered) return;
+        WindowState.remove(window, 'layoutBeforeShrink');
+        let adopted = 0;
+        for (const [id, center] of remembered) {
+            if (!this._positionSnapshot.has(id)) continue;
+            this._positionSnapshot.set(id, center);
+            adopted++;
+        }
+        Logger.log(`[RESTORE ANCHOR] ${window.get_id()}: ${adopted} slots from before the shrink`);
+    }
+
     // Snapshot positions (for stability scoring), find any restore anchor, and resolve the
     // pinned composition, all read by the _tile call that follows.
     _prepareTilePass(meta_windows, windows, workspace) {
@@ -1933,6 +2481,8 @@ export const TilingManager = GObject.registerClass({
             this._positionSnapshot.set(w.get_id(), { cx: f.x + f.width / 2, cy: f.y + f.height / 2 });
         }
 
+        this._rememberLayoutBeforeShrink();
+
         // Pull a just-restored window back toward its old miniature slot. The restore path tiles
         // with a null reference, so find the flagged window among these.
         this._restoreAnchor = null;
@@ -1940,6 +2490,7 @@ export const TilingManager = GObject.registerClass({
             const rc = WindowState.get(w, 'restoreAnchorCenter');
             if (rc) {
                 this._restoreAnchor = { id: w.get_id(), cx: rc.cx, cy: rc.cy };
+                this._adoptLayoutBeforeShrink(w);
                 break;
             }
         }
@@ -1954,11 +2505,23 @@ export const TilingManager = GObject.registerClass({
         // Honor a pinned composition only while it still matches the current window count; a
         // count change (window opened/closed) invalidates it, handing control to the auto-layout.
         this._activePinnedShape = null;
+        this._activePinnedVertical = null;
+        this._activePinnedWorkspace = workspace;
+        this._pinnedSizesUnchanged = false;
         const pin = this._pinnedComposition.get(workspace);
-        if (pin) {
-            if (pin.count === windows.length) this._activePinnedShape = pin.shape;
-            else this._pinnedComposition.delete(workspace);
+        if (!pin) return;
+        if (pin.count !== windows.length) {
+            this._pinnedComposition.delete(workspace);
+            return;
         }
+
+        this._activePinnedShape = pin.shape;
+        this._activePinnedVertical = pin.vertical;
+        // A drop retiles three times and the suppression above only covers the first, so the
+        // sizes at pin time say how long the dropped order still stands.
+        const sizes = windows.map(w => `${w.id}:${w.width}x${w.height}`).sort().join();
+        pin.sizes ??= sizes;
+        this._pinnedSizesUnchanged = pin.sizes === sizes;
     }
 
     // A single window never overflows; a maximized/fullscreen sibling always forces it.
@@ -2087,6 +2650,7 @@ export const TilingManager = GObject.registerClass({
 
         let tile_info = this._tile(windows, tileArea, dryRun);
         this._activePinnedShape = null;
+        this._activePinnedVertical = null;
         let overflow = this._determineOverflow(tile_info, workspace_windows);
 
         if (dryRun) return this._dryRunResult(overflow, workspace);
@@ -2271,29 +2835,36 @@ export const TilingManager = GObject.registerClass({
     _recordGroupStability(tile_info) {
         if (!(tile_info?.levels?.length > 0)) return;
         this._lastTiledOrder = tile_info.levels.flatMap(l => l.windows).map(w => w.id);
-        const newGroupAssignment = new Map();
-        tile_info.levels.forEach((level, levelIdx) => {
-            for (const w of level.windows) newGroupAssignment.set(w.id, levelIdx);
-        });
+        const newGroupAssignment = {
+            pairs: this._coMembershipPairs(tile_info.levels),
+            ids: new Set(tile_info.levels.flatMap(l => l.windows.map(w => w.id))),
+        };
         this._lastGroupAssignment = newGroupAssignment;
-        Logger.log(`[GROUP STABILITY] Recorded assignment: ${[...newGroupAssignment].map(([id, idx]) => `${id}->col${idx}`).join(', ')}`);
+        this._lastTiledVertical = !!tile_info.vertical;
+        this._lastTiledShape = tile_info.vertical && tile_info.levels.every(lv => lv.rows)
+            ? tile_info.levels.map(lv => lv.rows.map(r => r.windows.length)) : null;
+        this._lastTiledRowCounts = !tile_info.vertical
+            ? tile_info.levels.map(lv => lv.windows.length) : null;
+        this._lastTileRanked = !!tile_info.orderOptimized;
+        // Partition rather than the pair set, which is quadratic and fires on every drag retile.
+        const partition = tile_info.levels.map(l => `[${l.windows.map(w => w.id).join(',')}]`).join('');
+        Logger.log(`[GROUP STABILITY] Recorded ${newGroupAssignment.pairs.size} pairs over ${partition}`);
     }
 
     _positionTiledWindows(workspace, monitor, tile_info, tileArea, meta_windows, reference_meta_window, computedSlots, work_area) {
         let animationsHandledPositioning = false;
         if (!this.isDragging && tile_info && tile_info.levels && tile_info.levels.length > 0) {
-            // Allow animation for windows returning from excluded state
             if (reference_meta_window && WindowState.get(reference_meta_window, 'justReturnedFromExclusion')) {
                 Logger.log(`Allowing animation for returning excluded window ${reference_meta_window.get_id()}`);
                 WindowState.remove(reference_meta_window, 'justReturnedFromExclusion');
             }
 
-            animationsHandledPositioning = this._animateTileLayout(workspace, monitor, tile_info, tileArea, meta_windows, reference_meta_window, computedSlots);
+            animationsHandledPositioning = this._animateTileLayout(workspace, monitor, tile_info, tileArea, meta_windows, reference_meta_window, computedSlots, work_area);
         }
 
         if (!animationsHandledPositioning) {
             Logger.log('Animations did not handle positioning, calling drawTile');
-            this._drawTile(workspace, monitor, tile_info, tileArea, meta_windows, false, computedSlots, work_area);
+            this._drawTile(workspace, monitor, tile_info, meta_windows, false, computedSlots, work_area);
             // _animateTileLayout owns the deferred unlock; since it didn't run,
             // release the lock now that positioning is done synchronously.
             this._unlockWorkspaceEarlyReturn(workspace);
@@ -2603,7 +3174,6 @@ export const TilingManager = GObject.registerClass({
         }
     }
 
-    // TARGET size the window wants to be
     savePreferredSize(window) {
         if (this._preferredSaveBlocked(window)) return;
 
@@ -2857,7 +3427,6 @@ export const TilingManager = GObject.registerClass({
                 WindowState.set(w, 'isConstrainedByMosaic', false);
                 WindowState.set(w, 'targetSmartResizeSize', null);
             } else {
-                // Still constrained, but update mask
                 this._setSmartResizeTarget(w, sim);
             }
         }
@@ -3037,9 +3606,16 @@ export const TilingManager = GObject.registerClass({
         }
     }
 
-    _binarySearchFitScale(buildSimulated, workArea) {
-        let lo = 0.0, hi = 1.0;
-        for (let i = 0; i < 15; i++) {
+    // A probe that overflows scans the whole candidate space to prove no order fits, so stop as
+    // soon as the scale stops meaning anything: one pixel of the widest range. lo must already fit.
+    _binarySearchFitScale(buildSimulated, workArea, lo = 0.0) {
+        let hi = 1.0;
+        const atMin = buildSimulated(0.0), atMax = buildSimulated(1.0);
+        const span = Math.max(1, ...atMax.map((w, i) =>
+            Math.max(w.width - atMin[i].width, w.height - atMin[i].height)));
+        const steps = Math.max(1, Math.ceil(Math.log2((hi - lo) * span)));
+
+        for (let i = 0; i < steps; i++) {
             const mid = (lo + hi) / 2;
             if (!this._tile(buildSimulated(mid), workArea, true).overflow)
                 lo = mid;
@@ -3120,6 +3696,8 @@ export const TilingManager = GObject.registerClass({
             const candidates = buildSimulated(lo).filter(sim => {
                 const d = windowData.get(sim.id);
                 if (!this._isMiniaturizationCandidate(d?.window, d, focusedId, resizingWindowId)) return false;
+                // The threshold falls back to the work area, so a window still at its preferred size trips it.
+                if (sim.width >= d.current.width && sim.height >= d.current.height) return false;
                 const { thresholdW, thresholdH } = this._miniatureThreshold(d.window, workArea);
                 return sim.width < thresholdW || sim.height < thresholdH;
             });
@@ -3147,7 +3725,10 @@ export const TilingManager = GObject.registerClass({
             if (!this._tile(buildSimulated(1.0), workArea, true).overflow) {
                 return 1.0;
             }
-            lo = this._binarySearchFitScale(buildSimulated, workArea);
+            // Marking only frees space, so last round's scale still fits and the search can resume
+            // there. The exception is a mini size bigger than the window's own minimum.
+            const floor = this._tile(buildSimulated(lo), workArea, true).overflow ? 0.0 : lo;
+            lo = this._binarySearchFitScale(buildSimulated, workArea, floor);
         }
         return lo;
     }
@@ -3198,6 +3779,10 @@ export const TilingManager = GObject.registerClass({
             if (d.pendingMiniature) {
                 const storedPreSize = d.pendingPreSize || d.current;
                 pendingWindows.push({ window: w, miniSize: d.miniSize, preSize: storedPreSize });
+                // Stamped here rather than in _markPendingMiniature because the fit search calls
+                // that one speculatively; an abort would leave the flag on and draw() would skip
+                // the window forever.
+                WindowState.set(w, PENDING_MINIATURE, true);
                 Logger.log(`[MINIATURE] ${w.get_id()} stored in pendingWindows: preSize=${storedPreSize.width}x${storedPreSize.height}, SKIPPING move_resize_frame (will be miniaturized)`);
                 continue;
             }
@@ -3208,17 +3793,39 @@ export const TilingManager = GObject.registerClass({
         return { pendingWindows, grownWindows };
     }
 
-    // Clear the targetRestoredSize bridge after the Wayland frame settles; until then
-    // WindowDescriptor reads this value instead of the stale frame.
+    // WindowDescriptor reads targetRestoredSize instead of the stale frame, so dropping it before
+    // the client acks the grow hands the next pass the old size. Slow acks run past several delays.
     _scheduleGrowSettle(grownWindows) {
         if (grownWindows.length === 0 || !this._extension?._timeoutRegistry) return;
 
+        let attemptsLeft = constants.RESIZE_SETTLE_MAX_ATTEMPTS;
+        let pending = grownWindows;
+
         this._extension._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
-            for (const gw of grownWindows) {
+            const lastTry = --attemptsLeft <= 0;
+            pending = pending.filter(gw => {
+                if (!lastTry && !this._reachedRestoredSize(gw)) {
+                    Logger.log(`[SMART RESIZE] ${gw.get_id()}: grow not acked yet, holding the restored size`);
+                    return true;
+                }
                 WindowState.remove(gw, 'targetRestoredSize');
-            }
-            return false;
+                return false;
+            });
+            return pending.length > 0 ? GLib.SOURCE_CONTINUE : GLib.SOURCE_REMOVE;
         }, 'tryFitWithResize_growSettle');
+    }
+
+    // Same 2px slop the shrink check uses, since the grow target came from a rounded layout.
+    _reachedRestoredSize(window) {
+        const target = WindowState.get(window, 'targetRestoredSize');
+        if (!target) return true;
+
+        // get_frame_rect on a disposed MetaWindow segfaults libmutter; a dead window can't
+        // grow any further, so treat it as settled and let the caller drop it.
+        if (!isWindowAlive(window)) return true;
+
+        const frame = window.get_frame_rect();
+        return frame.width >= target.width - 2 && frame.height >= target.height - 2;
     }
 
     // Re-run binary search with corrected minimums after client-side clamping detection.
@@ -3373,7 +3980,6 @@ export const TilingManager = GObject.registerClass({
         // Save pending miniatures before recursive call (which resets the array)
         const savedPending = this._pendingMiniatureWindows;
         this.tileWorkspaceWindows(workspace, null, monitor, true);
-        // Restore after recursive tiling completes
         this._pendingMiniatureWindows = savedPending;
     }
 
@@ -3389,6 +3995,7 @@ export const TilingManager = GObject.registerClass({
         this._workspaceSwaps = null;
         this._pinnedComposition = null;
         this._activePinnedShape = null;
+        this._activePinnedVertical = null;
         this._edgeTilingManager = null;
         this._drawingManager = null;
         this._animationsManager = null;
@@ -3586,6 +4193,25 @@ class WindowDescriptor {
     }
 }
 
+// Slack inside a level belongs on the outer side, never between two neighbors,
+// so the mosaic densifies toward the middle. Clamping keeps a level that straddles
+// the origin from pushing its window past its own edge.
+function outwardOffset(levelStart, levelExtent, windowExtent, origin) {
+    const slack = levelExtent - windowExtent;
+    if (slack <= 0) return 0;
+    return Math.min(Math.max(origin - windowExtent / 2 - levelStart, 0), slack);
+}
+
+// Which way a short window leans: toward the next level, not toward the screen's mid-line.
+// Two windows sharing a level have to leave the same gap to the level beside them, and the
+// mid-line lands short of that whenever a level straddles it. Alone, it's the only reference.
+function neighborOrigin(levelStart, levelExtent, index, count, origin) {
+    if (count < 2) return origin;
+    if (index === 0) return levelStart + levelExtent;
+    if (index === count - 1) return levelStart;
+    return levelStart + levelExtent / 2;
+}
+
 class Level {
     constructor(work_area) {
         this.x = 0;
@@ -3612,16 +4238,11 @@ class Level {
         window.draw(meta_windows, drawX, drawY, masks, isDragging, drawingManager, dryRun);
     }
 
-    draw_horizontal(workspace, monitor, meta_windows, work_area, y, masks, isDragging, drawingManager, dryRun = false, slotsOut = null, bounds = null) {
+    draw_horizontal(workspace, monitor, meta_windows, y, masks, isDragging, drawingManager, dryRun = false, slotsOut = null, bounds = null) {
         let x = this.x;
         for(const window of this.windows) {
-            const center_offset = (work_area.height / 2 + work_area.y) - (y + window.height / 2);
-            let y_offset = 0;
-            if(center_offset > 0)
-                y_offset = Math.min(center_offset, this.height - window.height);
-
             const rawX = window.targetX !== undefined ? window.targetX : x;
-            const rawY = window.targetY !== undefined ? window.targetY : y + y_offset;
+            const rawY = window.targetY !== undefined ? window.targetY : y;
             this._placeWindow(workspace, monitor, window, meta_windows, rawX, rawY, masks, isDragging, drawingManager, dryRun, slotsOut, bounds);
             x += window.width + constants.WINDOW_SPACING;
         }

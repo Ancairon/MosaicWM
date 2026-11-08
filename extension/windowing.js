@@ -212,7 +212,6 @@ export const WindowingManager = GObject.registerClass({
 
             Logger.log(`[MOVE OVERSIZED] request window=${window.get_id()} monitor=${monitor} options=${JSON.stringify(options)} stack=${stack}`);
 
-            // Notify that overflow is starting
             if (this._overflowStartCallback) {
                 this._overflowStartCallback();
             }
@@ -262,7 +261,6 @@ export const WindowingManager = GObject.registerClass({
                     }
                 }, this._timeoutRegistry);
 
-                // Re-tile after window has settled
                 if (this._tilingManager) {
                     Logger.log('moveOversizedWindow: workspace switch done, retiling immediately and then waiting for animations');
 
@@ -408,7 +406,26 @@ export const WindowingManager = GObject.registerClass({
     }
 
     isMaximizedOrFullscreen(window) {
-        return window.is_maximized() || window.is_fullscreen();
+        return window.is_maximized() || window.is_fullscreen() || this._looksNativelyFullscreen(window);
+    }
+
+    // Some game engines (Unity's borderless "Fullscreen Window" mode) resize to the monitor's
+    // resolution without setting the WM's real maximize/fullscreen state, so nothing marks
+    // them sacred and mosaic shrinks then miniaturizes them like any oversized window. Catch
+    // the shape instead: no preferred/opening size captured yet, and the frame already covers
+    // the whole physical monitor, which normal placement (even maximized) never reaches.
+    _looksNativelyFullscreen(window) {
+        if (WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize'))
+            return false;
+
+        const monitor = window.get_monitor();
+        if (monitor === null || monitor === undefined || monitor < 0) return false;
+
+        const geom = global.display.get_monitor_geometry(monitor);
+        if (!geom) return false;
+
+        const frame = window.get_frame_rect();
+        return frame.width >= geom.width && frame.height >= geom.height;
     }
 
     renavigate(workspace, condition, lastVisitedIndex = null, monitorIndex = -1) {
@@ -422,8 +439,15 @@ export const WindowingManager = GObject.registerClass({
             const target = this._pickRenavigateTarget(workspace, currentIndex, lastVisitedIndex);
 
             if (target && target.index() >= 0 && target.index() !== currentIndex) {
-                target.activate(this.getTimestamp());
-                this.showWorkspaceSwitcher(target, monitorIndex);
+                const currentWindows = workspace.list_windows();
+                if (currentWindows.some(w => w.is_on_all_workspaces())) {
+                    Logger.log(
+                        '[RENAVIGATE] Current WS has is_on_all_workspaces() windows; skipping to avoid GNOME Shell WorkspaceSwitcherPopup freeze'
+                    );
+                } else {
+                    target.activate(this.getTimestamp());
+                    this.showWorkspaceSwitcher(target, monitorIndex);
+                }
             } else {
                 Logger.log(`[RENAVIGATE] No suitable target found to navigate away from WS-${currentIndex}`);
             }
@@ -462,7 +486,21 @@ export const WindowingManager = GObject.registerClass({
             }
         }
 
+        return this._guardLeftmostTarget(target, currentIndex);
+    }
+
+    // The leftmost workspace has nothing to return to; going right strands
+    // the user in the overflow zone when the target is empty.
+    _guardLeftmostTarget(target, currentIndex) {
+        if (currentIndex === 0 && target && !this._workspaceHasWindows(target)) {
+            Logger.log(`[RENAVIGATE] WS-0 is leftmost and WS-${target.index()} is empty; staying put`);
+            return null;
+        }
         return target;
+    }
+
+    _workspaceHasWindows(workspace) {
+        return workspace.list_windows().some(w => !this.isExcluded(w));
     }
 
     // The last workspace is the placeholder, so from there the only way out is left.
@@ -494,6 +532,14 @@ export const WindowingManager = GObject.registerClass({
 
     showWorkspaceSwitcher(workspace, monitorIndex = -1) {
         if (!workspace) return;
+
+        const wsWindows = workspace.list_windows();
+        if (wsWindows.some(w => w.is_on_all_workspaces())) {
+            Logger.log(
+                '[SWITCHER] Workspace has is_on_all_workspaces() windows; skipping to avoid GNOME Shell WorkspaceSwitcherPopup freeze'
+            );
+            return;
+        }
 
         const index = workspace.index();
         Logger.log(`[SWITCHER] Activating OSD for WS-${index}`);

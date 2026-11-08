@@ -143,6 +143,7 @@ export const ResizeHandler = GObject.registerClass({
     onResizeBegin(window, grabpo) {
         this._resizeInOverflow = false;
         this._lastResizeTileTime = 0;
+        this.tilingManager.isResizing = true;
         this.animationsManager.setResizingWindow(window.get_id());
         // Null grabpo = keyboard resize. Suppress onSizeChanged retiles until onResizeEnd.
         this._keyboardResizingWindowId = grabpo === null ? window.get_id() : null;
@@ -162,6 +163,10 @@ export const ResizeHandler = GObject.registerClass({
         // Keep resizingWindowId set during final retile to prevent animation jiggle
         this._keyboardResizingWindowId = null;
         Logger.log(`Resize ended for window ${window.get_id()}`);
+
+        // Clear before the final retile, same as disableDragMode ahead of a drop's retile: the
+        // grab is over, so this pass is allowed to commit a real eviction.
+        this.tilingManager.isResizing = false;
 
         const tileState = this.edgeTilingManager.getWindowState(window);
         const isEdgeTiled = tileState && tileState.zone !== TileZone.NONE;
@@ -720,10 +725,17 @@ export const ResizeHandler = GObject.registerClass({
         if (this.tilingManager.isDragging) {
             return true;
         }
-        if (this._ext.dragHandler?._restoringFromEdgeTile) {
+        if (this._isEdgeTileRestoreSettling(now)) {
             return true;
         }
         return false;
+    }
+
+    // The drag flag and the edge-tiling stamp both mean the same thing here, just raised by
+    // different callers (mouse drag vs. every removeTile caller including the keyboard path).
+    _isEdgeTileRestoreSettling(now) {
+        return this._ext.dragHandler?._restoringFromEdgeTile ||
+            this.edgeTilingManager.isRestoringFromEdgeTile(now);
     }
 
     // Returns true when the window was ejected (or the attempt was aborted), so the caller stops.

@@ -3,7 +3,7 @@
 // Window swapping logic
 
 import * as Logger from './logger.js';
-import { TileZone } from './constants.js';
+import { TileZone, ZONE_VERTICAL_PAIR } from './constants.js';
 import * as WindowState from './windowState.js';
 import { monotonicNow } from './timing.js';
 
@@ -180,6 +180,33 @@ export const SwappingManager = GObject.registerClass({
         WindowState.set(window2, 'lastSwapTime', monotonicNow());
 
         return true;
+    }
+
+    // Target of the Super+Up/Down stack walk when a quarter has a partner above or below;
+    // resolveArrowIntent only asks for this once that partner is known to exist.
+    swapVerticalQuarterPair(window, direction) {
+        if (!this._edgeTilingManager) return false;
+
+        const zone = this._edgeTilingManager.getWindowState(window)?.zone;
+        const pairZone = ZONE_VERTICAL_PAIR[zone];
+        if (!pairZone) return false;
+
+        const lastSwap = WindowState.get(window, 'lastSwapTime');
+        if (lastSwap && (monotonicNow() - lastSwap) < 500) {
+            Logger.log(`Quarter swap throttled for window ${window.get_id()}`);
+            return false;
+        }
+
+        const workspace = window.get_workspace();
+        const monitor = window.get_monitor();
+        const partner = this._edgeTilingManager.getEdgeTiledWindows(workspace, monitor)
+            .find(w => w.zone === pairZone);
+        if (!partner) {
+            Logger.log(`No quarter partner for window ${window.get_id()} direction=${direction}`);
+            return false;
+        }
+
+        return this._swapTiledWindows(window, zone, partner.window, pairZone, workspace, monitor);
     }
 
     _tileToEmptyZone(window, zone, workspace, monitor) {

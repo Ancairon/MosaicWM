@@ -425,8 +425,23 @@ export const WindowHandler = GObject.registerClass({
         // reverse smart resize back into tiling forever. stopDrag retiles the source.
         if (this._ext.dragHandler._draggedWindow) return;
 
+        const windowId = window.get_id();
+
         this._timeoutRegistry.add(constants.RETILE_DELAY_MS, () => {
             this.windowingManager.invalidateWindowsCache();
+
+            // A monitor change on its own never reaches onWindowRemoved, so the miniatures this
+            // window was crowding would stay shrunk. Restoring retiles on its own.
+            if (!WindowState.get(window, 'movedByOverflow')) {
+                const remainingWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
+                    .filter(w => w.get_id() !== windowId &&
+                                 !this._ext.edgeTilingManager.isEdgeTiled(w) &&
+                                 !this.windowingManager.isExcluded(w));
+
+                if (this._tryAutoRestoreMiniature(remainingWindows, workspace, monitor))
+                    return GLib.SOURCE_REMOVE;
+            }
+
             this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
             return GLib.SOURCE_REMOVE;
         }, 'windowHandler_leftMonitorRetile');
@@ -495,6 +510,16 @@ export const WindowHandler = GObject.registerClass({
     // the flag on re-enqueue, and an overflow move never claims at all since it never
     // re-enqueues (a stale claim would block the retile at the window's real close).
     // Options below capture real behavioral differences between the two callers, not duplication.
+    // A workspace captured before a deferred retile can go stale by the time that
+    // retile runs: GNOME's own dynamic-workspace pruning removes a workspace this same
+    // window-close just emptied, reindexing everything and re-firing active-workspace-changed
+    // as a side effect. Falling back to whatever ended up active resyncs the workspace the
+    // reindex actually landed on, instead of silently dropping the retile pass.
+    _resolveRetileWorkspace(workspace) {
+        if (workspace && workspace.index() >= 0) return workspace;
+        return global.workspace_manager.get_active_workspace();
+    }
+
     _retileAfterWindowGone(removedWindow, remainingWindows, workspace, monitor, freedWidth, freedHeight, options = {}) {
         const opts = this._retileOptions(options);
 
@@ -652,11 +677,12 @@ export const WindowHandler = GObject.registerClass({
                 afterAnimations(this._ext.animationsManager, () => {
                     // Both waits run inline when animations are off, so this can still
                     // execute inside the destroy signal, with the dying window listed.
-                    const remainingWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
+                    const retileWorkspace = this._resolveRetileWorkspace(workspace);
+                    const remainingWindows = this.windowingManager.getMonitorWorkspaceWindows(retileWorkspace, monitor)
                         .filter(w => w.get_id() !== windowId &&
                                      !this.edgeTilingManager.isEdgeTiled(w) && !this.windowingManager.isExcluded(w));
 
-                    this._retileAfterWindowGone(window, remainingWindows, workspace, monitor, freedWidth, freedHeight, {
+                    this._retileAfterWindowGone(window, remainingWindows, retileWorkspace, monitor, freedWidth, freedHeight, {
                         requireConstrainedCheck: true,
                         reverseLogLabel: '[REVERSE-DESTROYED] Window closed',
                         settleTimeoutName: 'windowHandler_destroyedRestoreSettle',
@@ -725,9 +751,14 @@ export const WindowHandler = GObject.registerClass({
         }
 
         this._isEvaluatingQueue = true;
-        // expectedWorkspace detects manual user switches; lastOverflowWorkspace cascades a
-        // batch's overflow; overflowedWorkspaces caps that cascade so it can't loop forever.
-        const state = { lastOverflowWorkspace: null, expectedWorkspace: null };
+        // lastOverflowWorkspace cascades a batch's overflow; overflowedWorkspaces caps that
+        // cascade so it can't loop forever.
+        const state = {
+            lastOverflowWorkspace: null,
+            // Only a move from batch start counts as a user switch: a batch spanning
+            // workspaces (monitor re-plug) has no expected workspace to compare against.
+            batchActiveWorkspace: this.windowingManager.getWorkspace(),
+        };
         const overflowedWorkspaces = new Set();
 
         while (this._evaluationQueue.length > 0) {
@@ -748,7 +779,6 @@ export const WindowHandler = GObject.registerClass({
             const resolved = this._resolveQueueItemWorkspace(window, workspace);
             if (resolved.skip) continue;
             workspace = this._applyQueueCascade(window, resolved.workspace, arrivedFromDnD, state, overflowedWorkspaces);
-            state.expectedWorkspace = workspace;
 
             Logger.log(`Evaluating queued window ${window.get_id()} on WS-${workspace.index()} (remaining: ${this._evaluationQueue.length})`);
             await this._evaluateQueuedWindowFit(window, workspace, monitor, arrivedFromDnD, state, overflowedWorkspaces);
@@ -779,14 +809,14 @@ export const WindowHandler = GObject.registerClass({
     // in-flight cascade), else keep cascading this batch's overflow. Returns that workspace.
     _applyQueueCascade(window, workspace, arrivedFromDnD, state, overflowedWorkspaces) {
         const activeWorkspace = this.windowingManager.getWorkspace();
-        const targetWorkspace = state.lastOverflowWorkspace || state.expectedWorkspace || workspace;
 
         // A drop is a destination the user chose, so "they navigated away" doesn't apply; without
         // this the overview drag lands the window and the cascade immediately drags it back.
         const droppedByUser = arrivedFromDnD;
 
-        if (!droppedByUser && activeWorkspace && targetWorkspace && activeWorkspace.index() !== targetWorkspace.index()) {
-            Logger.log(`Evaluation queue: User switched to WS-${activeWorkspace.index()} during processing (expected WS-${targetWorkspace.index()}) - following user`);
+        if (!droppedByUser && activeWorkspace && state.batchActiveWorkspace &&
+            activeWorkspace.index() !== state.batchActiveWorkspace.index()) {
+            Logger.log(`Evaluation queue: User switched to WS-${activeWorkspace.index()} during processing (batch started on WS-${state.batchActiveWorkspace.index()}) - following user`);
             state.lastOverflowWorkspace = null;
             overflowedWorkspaces.clear();
             window.change_workspace(activeWorkspace);
@@ -822,7 +852,6 @@ export const WindowHandler = GObject.registerClass({
             if (resultWorkspace && resultWorkspace.index() !== workspace.index()) {
                 overflowedWorkspaces.add(workspace.index());
                 state.lastOverflowWorkspace = resultWorkspace;
-                state.expectedWorkspace = resultWorkspace;
             }
 
             const managedWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
@@ -1178,7 +1207,6 @@ export const WindowHandler = GObject.registerClass({
                 });
             }
 
-            // Safety timeout
             timeoutId = this._timeoutRegistry.add(400, () => {
                 // Pre-flight check: If the actor was disposed while waiting, abort safely.
                 if (!isWindowAlive(window)) {
@@ -1421,7 +1449,6 @@ export const WindowHandler = GObject.registerClass({
         const isCrossWorkspaceDrop = previousWorkspaceIndex !== undefined
             && previousWorkspaceIndex !== WORKSPACE.index()
             && timeSinceRemoved < constants.SAFETY_TIMEOUT_BUFFER_MS;
-        // Skip if this is an overflow move, not a real drag-drop
         if (!isCrossWorkspaceDrop || WindowState.get(WINDOW, 'movedByOverflow')) return;
 
         // Mark as DnD arrival; triggers expansion after tiling
@@ -1479,7 +1506,7 @@ export const WindowHandler = GObject.registerClass({
         }
 
         this._timeoutRegistry.add(constants.WINDOW_VALIDITY_CHECK_INTERVAL_MS, () => {
-            const WORKSPACE = workspace;
+            const WORKSPACE = this._resolveRetileWorkspace(workspace);
 
             // A window leaving for another monitor already reports the destination here,
             // which counts the siblings it left behind as zero and reads as an empty
