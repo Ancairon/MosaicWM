@@ -613,6 +613,13 @@ export const WindowHandler = GObject.registerClass({
         const monitor = window.get_monitor();
         const windowId = window.get_id();
         const windowWorkspace = window.get_workspace();
+        // Capture before teardown: a sacred (maximized/fullscreen) window is
+        // often the sole occupant of its workspace, so closing it shouldn't
+        // trigger the "workspace is now empty, navigate away" cleanup below.
+        // is_maximized()/is_fullscreen() are plain state flags, unlike
+        // get_frame_rect() below, so they're safe to read on the already-
+        // unmanaged MetaWindow the 'destroy' signal hands us here.
+        const wasSacred = this.windowingManager.isMaximizedOrFullscreen(window);
 
         Logger.log(`onWindowDestroyed: ${windowId}`);
 
@@ -661,15 +668,25 @@ export const WindowHandler = GObject.registerClass({
             const managedWindows = windows.filter(w => !this.windowingManager.isExcluded(w));
 
             if (managedWindows.length === 0) {
-                // Skip if overflow is in progress; window is being moved and will arrive soon
-                if (this._overflowInProgress) {
-                    Logger.log('Workspace is empty but overflow in progress; skipping navigation');
-                    return;
-                }
-
-                this.windowingManager.renavigate(workspace, true, this._ext._lastVisitedWorkspace, monitor);
+                this._renavigateIfDestroyedWorkspaceEmpty(workspace, monitor, wasSacred);
             }
         }
+    }
+
+    // Split out of onWindowDestroyed to keep its cyclomatic complexity within lint limits.
+    _renavigateIfDestroyedWorkspaceEmpty(workspace, monitor, wasSacred) {
+        // Skip if overflow is in progress; window is being moved and will arrive soon
+        if (this._overflowInProgress) {
+            Logger.log('Workspace is empty but overflow in progress; skipping navigation');
+            return;
+        }
+
+        if (wasSacred) {
+            Logger.log('Sacred window closed alone - skipping workspace navigation');
+            return;
+        }
+
+        this.windowingManager.renavigate(workspace, true, this._ext._lastVisitedWorkspace, monitor);
     }
 
     enqueueWindowForEvaluation(window, workspace, monitor) {
@@ -1437,6 +1454,14 @@ export const WindowHandler = GObject.registerClass({
 
         const wasMovedByOverflow = WindowState.get(window, 'movedByOverflow');
 
+        // Capture before teardown: a sacred (maximized/fullscreen) window is
+        // often the sole occupant of its workspace, so closing it shouldn't
+        // trigger the "workspace is now empty, navigate away" cleanup below.
+        // is_maximized()/is_fullscreen() are plain state flags, unlike
+        // get_frame_rect() below, so they're safe to read on a window that may
+        // already be unmanaged by the time removal is reported here.
+        const wasSacred = this.windowingManager.isMaximizedOrFullscreen(window);
+
         // Capture removed window's size before any operations. Guarded since the
         // window may already be disposed when removal comes from a destroy.
         const removedFrame = isWindowAlive(window) ? window.get_frame_rect() : null;
@@ -1501,6 +1526,8 @@ export const WindowHandler = GObject.registerClass({
                     }
                     if (wasMovedByOverflow) {
                         Logger.log('_windowRemoved: Workspace empty but window was moved by overflow; skipping navigation');
+                    } else if (wasSacred) {
+                        Logger.log('_windowRemoved: Sacred window closed alone - skipping workspace navigation');
                     } else {
                         Logger.log('_windowRemoved: Workspace truly empty, navigating away');
                         this._ext.windowingManager.renavigate(WORKSPACE, global.workspace_manager.get_active_workspace() === WORKSPACE, this._ext._lastVisitedWorkspace, MONITOR);
