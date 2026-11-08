@@ -29,6 +29,7 @@ import { DrawingManager } from './drawing.js';
 import { AnimationsManager } from './animations.js';
 import { MosaicLayoutStrategy } from './overviewLayout.js';
 import { MosaicRenderer } from './mosaicRenderer.js';
+import { MosaicConstraints } from './mosaicConstraint.js';
 import { TimeoutRegistry, createDebounced, afterAnimations } from './timing.js';
 import { WindowHandler } from './windowHandler.js';
 import { DragHandler } from './dragHandler.js';
@@ -69,7 +70,6 @@ export default class WindowMosaicExtension extends Extension {
         this.resizeHandler = null;
 
         this.miniatureManager    = null;
-        this._miniatureCascadeIds  = null;
         this._lastFocusedWindowId  = null;
         this._focusWindowChangedId = 0;
         this._miniatureRestoredId  = 0;
@@ -85,6 +85,7 @@ export default class WindowMosaicExtension extends Extension {
         this._injectionManager = null;
 
         this._timeoutRegistry = null;
+        this._pendingOverviewHiddenCallbacks = [];
 
         this._disabledWorkspaceStates = new WeakMap();
         this._mosaicDisabledByDefault = false;
@@ -181,6 +182,12 @@ export default class WindowMosaicExtension extends Extension {
         }
     }
 
+    _runPendingOverviewHiddenCallbacks() {
+        const deferred = this._pendingOverviewHiddenCallbacks;
+        this._pendingOverviewHiddenCallbacks = [];
+        for (const cb of deferred) cb();
+    }
+
     _workspaceSwitchedHandler = () => {
         const newWorkspace = this._workspaceManager.get_active_workspace();
         const newIndex = newWorkspace.index();
@@ -192,7 +199,6 @@ export default class WindowMosaicExtension extends Extension {
 
         this._currentWorkspaceIndex = newIndex;
 
-        // Tiling while the switch animation runs races it; wait until it finishes.
         afterAnimations(this.animationsManager, () => {
             Logger.log(`Workspace animation complete - ready for operations on workspace ${newIndex}`);
         }, this._timeoutRegistry);
@@ -228,6 +234,7 @@ export default class WindowMosaicExtension extends Extension {
         this._disabledWorkspaceStates = new WeakMap();
         this._mosaicDisabledByDefault = false;
         this._timeoutRegistry = new TimeoutRegistry();
+        this._pendingOverviewHiddenCallbacks = [];
         this._workspaceManager = global.workspace_manager;
 
         // SettingsOverrider already handles a stale override from a previous
@@ -284,7 +291,6 @@ export default class WindowMosaicExtension extends Extension {
         this.miniatureManager.setTimeoutRegistry(this._timeoutRegistry);
         this.miniatureManager.setAnimationsManager(this.animationsManager);
         this.edgeTilingManager.setMiniatureManager(this.miniatureManager);
-        this._miniatureCascadeIds = new Set();
         this._lastFocusedWindowId = null;
 
         this._miniatureRestoredId = this.miniatureManager.connect('miniature-restored',
@@ -305,8 +311,6 @@ export default class WindowMosaicExtension extends Extension {
             new GLib.Variant('b', false)
         );
 
-        // Disable attach-modal-dialogs to prevent squashed Overview previews
-        // When enabled, attached dialogs expand the window bounding box causing layout issues
         this._settingsOverrider.add(
             this._mutterSettings,
             'attach-modal-dialogs',
@@ -532,12 +536,18 @@ export default class WindowMosaicExtension extends Extension {
         // Mutter already accepts move_resize_frame here, so real windows are in place
         // before the closing animation finishes and nothing flashes untiled.
         this._onOverviewHidingId = Main.overview.connect('hiding', () => {
+            // Before the flush, since a restored window's group region is still its miniature size
+            // until its pass runs.
+            this._runPendingOverviewHiddenCallbacks();
+            this.mosaicRenderer?.blendFrozenOverviewSlots();
             Logger.log('[FLUSH] triggered by hiding');
             this._flushMosaicToWindows();
         });
         this._onOverviewHiddenId = Main.overview.connect('hidden', () => {
             this.animationsManager.setOverviewActive(false);
             this.miniatureManager?.setOverviewActive(false);
+            // Overview stays visible through the exit, so a restore that lands during it is still queued.
+            this._runPendingOverviewHiddenCallbacks();
             // A slot can get recomputed between 'hiding' and 'hidden'; this catches that window's final value.
             Logger.log('[FLUSH] triggered by hidden');
             this._flushMosaicToWindows();
@@ -720,16 +730,9 @@ export default class WindowMosaicExtension extends Extension {
         if (!this._focusEligibleForRestore(window)) return;
 
         const windowId = window.get_id();
-        Logger.log(`[FOCUS] Miniature focused ${windowId} (prev=${prevFocusedId}) cascade=${this._miniatureCascadeIds?.has(windowId)}`);
-
-        // A cascade auto-focus doesn't get to restore; only a deliberate re-focus does.
-        if (this._miniatureCascadeIds?.has(windowId) &&
-            !this._resolveCascadeFocus(window, windowId, prevFocusedId)) {
-            return;
-        }
+        Logger.log(`[FOCUS] Miniature focused ${windowId} (prev=${prevFocusedId})`);
 
         Logger.log(`[FOCUS] Triggering restore ${windowId}`);
-        this._miniatureCascadeIds.clear();
         this.tilingManager._isSmartResizingBlocked = true;
         WindowState.set(window, 'restoringFromMiniature', true);
 
@@ -751,24 +754,6 @@ export default class WindowMosaicExtension extends Extension {
         return true;
     }
 
-    // Returns true to let the restore proceed (deliberate re-focus), false when it was an
-    // auto-focus during a cascade, which instead hands focus to a non-miniature window.
-    _resolveCascadeFocus(window, windowId, prevFocusedId) {
-        if (prevFocusedId !== windowId) {
-            Logger.log(`[FOCUS] Allow restore ${windowId} (deliberate, prev=${prevFocusedId})`);
-            this._miniatureCascadeIds.delete(windowId);
-            return true;
-        }
-
-        const ws  = window.get_workspace();
-        const mon = window.get_monitor();
-        const nonMiniature = this.windowingManager.getMonitorWorkspaceWindows(ws, mon)
-            .find(w => !WindowState.get(w, IS_MINIATURE) && !this.windowingManager.isExcluded(w));
-        Logger.log(`[FOCUS] Block cascade restore ${windowId} → activating ${nonMiniature?.get_id() ?? 'none'}`);
-        if (nonMiniature) nonMiniature.activate(global.get_current_time());
-        return false;
-    }
-
     _onMiniatureRestored(window) {
         if (this._dndPendingWindowId === window.get_id()) {
             this._dndScheduleRestore?.cancel();
@@ -782,77 +767,52 @@ export default class WindowMosaicExtension extends Extension {
         if (!workspace) return;
         if (!this.isMosaicEnabledForWorkspace(workspace)) return;
 
-        // A drop's preview cleanup restores several miniatures in a row; retiling per restore
-        // re-miniaturizes them mid-drag and ping-pongs into a storm. The drag's own drop retile
-        // handles layout, so skip this heavy pass while that cleanup is running.
-        if (this.dragHandler?._suppressRestoreRetile) return;
+        if (this._restoreRetileOwnedElsewhere()) return;
 
         const monitor = window.get_monitor();
-        const workArea = this.tilingManager.getUsableWorkArea(workspace, monitor);
-
-        const existingWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w =>
-                isWindowAlive(w) &&
-                w.get_id() !== window.get_id() &&
-                !this.edgeTilingManager.isEdgeTiled(w) &&
-                !WindowState.get(w, 'pendingInQueue') &&
-                !this.windowingManager.isExcluded(w) &&
-                !this.windowingManager.isMaximizedOrFullscreen(w)
-            );
-
-        // Treat the restored window as the user-focused one, since Mutter's focus
-        // hasn't shifted yet (window.activate runs after the 250ms animation),
-        // so the previously-focused sibling would otherwise be excluded from
-        // miniaturization candidates and nothing would shrink.
-        const resizeResult = this.tilingManager.tryFitWithResize(window, existingWindows, workArea, workspace, window);
 
         const doTile = () => {
-            if (resizeResult?.success) {
-                this.tilingManager._isSmartResizingBlocked = true;
-                this.tilingManager._restoringWindowId = window.get_id();
-                try {
-                    this.tilingManager._pendingMiniatureWindows = resizeResult.pendingWindows ?? [];
-                    this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-                } finally {
-                    this.tilingManager._isSmartResizingBlocked = false;
-                    this.tilingManager._restoringWindowId = null;
-                }
-            } else {
-                this.tilingManager.tileWorkspaceWindows(workspace, window, monitor, false);
+            if (!isWindowAlive(window)) return;
+            // Capped as a window for its own pass, so the allocation shrinks everyone else first
+            // and no eject site can pick the window the user just brought back.
+            WindowState.set(window, 'restoringFromMiniature', true);
+            let fits;
+            try {
+                fits = this.tilingManager.measureEvent('restore', () => {
+                    if (this.tilingManager.retileWithAllocation(workspace, monitor, null, { dryRun: true }).overflow)
+                        return false;
+                    this.tilingManager.retileWithAllocation(workspace, monitor);
+                    return true;
+                });
+            } finally {
+                WindowState.remove(window, 'restoringFromMiniature');
             }
-
-            // restoreMiniature only undoes the scale, not the frame. If this was last
-            // shrunk via Smart Resize's skip-resize miniaturize path, the real frame
-            // is still pre-restore size, so give reverse smart resize a chance to grow it back.
-            const allWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-                .filter(w => !this.edgeTilingManager.isEdgeTiled(w) && !this.windowingManager.isExcluded(w));
-            const grew = this.tilingManager.tryRestoreWindowSizes(allWindows, workArea, null, null, workspace, monitor);
-            if (grew) {
-                this._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
-                    for (const w of allWindows) {
-                        WindowState.remove(w, 'isReverseSmartResizing');
-                    }
-                    this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
-                    this._tryCascadeMiniatureRestore(workspace, monitor);
-                    return GLib.SOURCE_REMOVE;
-                }, 'miniatureRestoreGrowSettle');
-            } else {
-                this._tryCascadeMiniatureRestore(workspace, monitor);
-            }
+            // Not even at its threshold with everyone else at the floor, so it goes back to being a thumbnail.
+            if (!fits) this._refuseMiniatureRestore(window, workspace, monitor);
         };
 
-        doTile();
+        // Mutter drops move_resize_frame while the overview is open and only takes them
+        // again from 'hiding', so the pass waits for that.
+        if (Main.overview.visible) {
+            Logger.log('Deferring miniature restore tiling until the overview hides');
+            this._pendingOverviewHiddenCallbacks.push(doTile);
+        } else {
+            doTile();
+        }
     }
 
-    // One restore can leave enough room for the next MRU miniature too; restoreMiniature
-    // fires this same handler synchronously, so this just keeps the chain going until
-    // nothing else fits, the same way a single window leaving already restores one.
-    _tryCascadeMiniatureRestore(workspace, monitor) {
-        if (this.dragHandler?._suppressRestoreRetile) return;
+    _refuseMiniatureRestore(window, workspace, monitor) {
+        Logger.log(`Restore refused for ${window.get_id()}: no room above its threshold`);
+        this.tilingManager.retileWithAllocation(workspace, monitor);
+        this.animationsManager?.shakeRefusal(window.get_compositor_private());
+    }
 
-        const remaining = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w => !this.edgeTilingManager.isEdgeTiled(w) && !this.windowingManager.isExcluded(w));
-        this.windowHandler?._tryAutoRestoreMiniature(remaining, workspace, monitor);
+    // A drop's preview cleanup restores several miniatures in a row; retiling per restore
+    // re-miniaturizes them mid-drag and ping-pongs into a storm. The drag's own drop retile
+    // handles layout, so skip this heavy pass while that cleanup is running. An allocation that
+    // restored the window is already sizing everyone in its own pass.
+    _restoreRetileOwnedElsewhere() {
+        return !!this.dragHandler?._suppressRestoreRetile || this.tilingManager.isApplyingAllocation;
     }
 
     _onDndEnter() {
@@ -1121,7 +1081,8 @@ export default class WindowMosaicExtension extends Extension {
         switch (intent.kind) {
             case 'tile': {
                 const workArea = workspace.get_work_area_for_monitor(window.get_monitor());
-                this.edgeTilingManager.applyTile(window, intent.zone, workArea);
+                if (!this.edgeTilingManager.applyTile(window, intent.zone, workArea))
+                    this._signalRefusal(window);
                 break;
             }
             case 'restore':
@@ -1135,8 +1096,16 @@ export default class WindowMosaicExtension extends Extension {
                 break;
             case 'maximize':
                 if (window.can_maximize()) window.maximize();
+                else this._signalRefusal(window);
                 break;
         }
+    }
+
+    // A window that refuses the zone, or refuses to maximize, would otherwise eat the keystroke
+    // in silence and read as a dead shortcut.
+    _signalRefusal(window) {
+        Logger.log(`Arrow refused by window ${window.get_id()}`);
+        this.animationsManager?.shakeRefusal(window.get_compositor_private());
     }
 
     // Mirrors the stock handlers we replaced, which never force a window that says it can't.
@@ -1277,7 +1246,6 @@ export default class WindowMosaicExtension extends Extension {
             this.miniatureManager = null;
         }
 
-        this._miniatureCascadeIds = null;
         this._lastFocusedWindowId = null;
     }
 
@@ -1345,8 +1313,10 @@ export default class WindowMosaicExtension extends Extension {
         this.animationsManager = null;
         this.mosaicRenderer?.destroy();
         this.mosaicRenderer = null;
+        MosaicConstraints.destroy();
         this.windowingManager = null;
         this._timeoutRegistry = null;
+        this._pendingOverviewHiddenCallbacks = [];
         this._mutterSettings = null;
         this._settingsOverrider = null;
         this._injectionManager = null;

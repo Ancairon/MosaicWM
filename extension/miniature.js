@@ -25,26 +25,42 @@ import {
     MINIATURE_ANIM_KIND,
 } from './windowState.js';
 
+// A miniature's region and MINIATURE_TARGET_POS describe its frame, same as any tiled window,
+// with the CSD shadow painting outside it; the overview draws the frame into that same region.
+
+// Assumes pivot (0,0). get_position() is the untransformed allocation, so this holds at any
+// current scale; the frame sits ext*scale inside the buffer's origin once scaled.
+function frameTranslation(actor, scale, targetX, targetY) {
+    const window = actor.meta_window;
+    const [ax, ay] = actor.get_position();
+    return {
+        tx: targetX - ax - (WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0) * scale,
+        ty: targetY - ay - (WindowState.get(window, MINIATURE_EXT_TOP) ?? 0) * scale,
+    };
+}
+
+function miniatureScaleToFit(window, region) {
+    const frame = window.get_frame_rect();
+    return Math.min(region.width / frame.width, region.height / frame.height);
+}
+
 // On GNOME Wayland, move_frame is ASYNC and Mutter may REJECT the target
 // position if the frame rect (original, unscaled size) would extend beyond
 // the monitor. So we cannot rely on move_frame to place the actor.
-// Instead compute translation from the actor's position to place the
-// frame visual at the desired target: tx = targetX - actorX - extLeft * scale.
-export function applyMiniatureActorState(actor, scale, extLeft, extTop, targetX, targetY) {
+// Instead compute translation from the actor's position so the scaled frame lands on
+// the target: tx = targetX - actorX - extLeft * scale.
+export function applyMiniatureActorState(actor, scale, targetX, targetY) {
     const [ax, ay] = actor.get_position();
     const [actorW, actorH] = actor.get_size();
     actor.set_pivot_point(0, 0);
     actor.remove_all_transitions();
     actor.set_scale(scale, scale);
-    const tx = targetX - ax - extLeft * scale;
-    const ty = targetY - ay - extTop * scale;
+    const { tx, ty } = frameTranslation(actor, scale, targetX, targetY);
     actor.set_translation(tx, ty, 0);
     Logger.log(`[MINIATURE] applyMiniatureActorState: actor=( ${ax},${ay} ${actorW}x${actorH}) target=(${targetX},${targetY}) scale=${scale} tx=${tx} ty=${ty} FINAL_SIZE=${Math.round(actorW * scale)}x${Math.round(actorH * scale)}`);
 }
 
-// Handles three cases: create/restore in-flight (update target, let onStopped settle),
-// move in-flight (cancel + redirect from current visual), idle (fresh animation).
-export function animateMiniatureToTarget(actor, window, scale, extLeft, extTop, targetX, targetY, duration) {
+export function animateMiniatureToTarget(actor, window, scale, targetX, targetY, duration) {
     const kind = WindowState.get(window, MINIATURE_ANIM_KIND);
 
     if (kind === 'create' || kind === 'restore') {
@@ -61,9 +77,7 @@ export function animateMiniatureToTarget(actor, window, scale, extLeft, extTop, 
     actor.set_pivot_point(0, 0);
     actor.set_scale(scale, scale);
 
-    const [ax, ay] = actor.get_position();
-    const targetTx = targetX - ax - extLeft * scale;
-    const targetTy = targetY - ay - extTop * scale;
+    const { tx: targetTx, ty: targetTy } = frameTranslation(actor, scale, targetX, targetY);
 
     actor.ease({
         translation_x: targetTx,
@@ -76,17 +90,14 @@ export function animateMiniatureToTarget(actor, window, scale, extLeft, extTop, 
             WindowState.remove(window, MINIATURE_ANIM_KIND);
             const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
             const sc = WindowState.get(window, MINIATURE_SCALE);
-            if (tgt && sc) {
-                const eL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-                const eT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-                applyMiniatureActorState(actor, sc, eL, eT, tgt.x, tgt.y);
-            }
+            if (tgt && sc) applyMiniatureActorState(actor, sc, tgt.x, tgt.y);
         },
     });
 }
 
 // Mutter may reset actor transforms (workspace switch, sync_window_geometry) without
-// signals; this effect enforces miniature transforms every frame at paint time.
+// signals; this effect enforces miniature transforms every frame at paint time, and
+// pins the click overlay to the actor's live frame rect so icon and frame never drift.
 const MiniatureEnforceEffect = GObject.registerClass({
     GTypeName: 'MosaicMiniatureEnforceEffect',
 }, class MiniatureEnforceEffect extends Clutter.Effect {
@@ -102,43 +113,59 @@ const MiniatureEnforceEffect = GObject.registerClass({
             return;
         }
 
-        if (WindowState.get(this._window, ANIMATING_MINIATURE)) {
-            super.vfunc_paint(...args);
-            return;
-        }
-
         if (WindowState.get(this._window, MINIATURE_SCREENSHOT_PAUSE)) {
             super.vfunc_paint(...args);
             return;
         }
 
-        const sc = WindowState.get(this._window, MINIATURE_SCALE);
-        const extL = WindowState.get(this._window, MINIATURE_EXT_LEFT) ?? 0;
-        const extT = WindowState.get(this._window, MINIATURE_EXT_TOP) ?? 0;
-        const tgt = WindowState.get(this._window, MINIATURE_TARGET_POS);
+        if (!WindowState.get(this._window, ANIMATING_MINIATURE)) {
+            const sc = WindowState.get(this._window, MINIATURE_SCALE);
+            const tgt = WindowState.get(this._window, MINIATURE_TARGET_POS);
 
-        if (sc && tgt) {
-            actor.set_pivot_point(0, 0);
-            actor.set_scale(sc, sc);
-            const [ax, ay] = actor.get_position();
-            const tx = tgt.x - ax - extL * sc;
-            const ty = tgt.y - ay - extT * sc;
-            actor.set_translation(tx, ty, 0);
+            if (sc && tgt) {
+                actor.set_pivot_point(0, 0);
+                actor.set_scale(sc, sc);
+                const { tx, ty } = frameTranslation(actor, sc, tgt.x, tgt.y);
+                actor.set_translation(tx, ty, 0);
+            }
         }
+
+        this._alignOverlayToFrame(actor);
         super.vfunc_paint(...args);
+    }
+
+    // Actor moves run on eased, instant and skipped timings, so no overlay write at a
+    // caller stays glued; the live transform at paint is the one position that can't drift.
+    _alignOverlayToFrame(actor) {
+        // Reparented actors (overview, workspace switch) carry parent-relative
+        // coordinates; tracking only makes sense in window_group space.
+        if (actor.get_parent() !== global.window_group) return;
+
+        const overlay = WindowState.get(this._window, MINIATURE_OVERLAY);
+        const preSize = WindowState.get(this._window, PRE_MINIATURE_SIZE);
+        if (!overlay || !preSize) return;
+
+        const [ax, ay] = actor.get_position();
+        const [actorW, actorH] = actor.get_size();
+        const [px, py] = actor.get_pivot_point();
+        const sx = actor.scale_x;
+        const sy = actor.scale_y;
+        const extL = (WindowState.get(this._window, MINIATURE_EXT_LEFT) ?? 0) * sx;
+        const extT = (WindowState.get(this._window, MINIATURE_EXT_TOP) ?? 0) * sy;
+
+        overlay.alignToFrame(
+            ax + px * actorW * (1 - sx) + actor.translation_x + extL,
+            ay + py * actorH * (1 - sy) + actor.translation_y + extT,
+            preSize.width * sx,
+            preSize.height * sy);
     }
 });
 
-// Captures clicks and hovers to restore the window; carries the app icon.
 const MiniatureClickOverlay = GObject.registerClass({
     GTypeName: 'MosaicMiniatureClickOverlay',
 }, class MiniatureClickOverlay extends Clutter.Actor {
     _init(window, miniatureManager) {
-        const preSize = WindowState.get(window, PRE_MINIATURE_SIZE);
-        const scale = WindowState.get(window, MINIATURE_SCALE);
-
-        const width = preSize.width * scale;
-        const height = preSize.height * scale;
+        const { width, height } = getMiniatureSize(window);
 
         // MINIATURE_TARGET_POS is where the frame lands, and preSize is the frame's
         // size, so the box needs no shadow-extent shift. Offsetting it would put the
@@ -253,34 +280,15 @@ const MiniatureClickOverlay = GObject.registerClass({
         this._hoverRestId = 0;
     }
 
-    updatePosition() {
+    // set_size lands on the next layout pass, so a size ease leaves BinLayout's
+    // centered icon a frame behind; the translation closes that gap per paint.
+    alignToFrame(x, y, width, height) {
         if (this._destroyed) return;
-        const tgt = WindowState.get(this._window, MINIATURE_TARGET_POS);
-        const scale = WindowState.get(this._window, MINIATURE_SCALE);
-        const preSize = WindowState.get(this._window, PRE_MINIATURE_SIZE);
-
-        if (tgt && scale && preSize) {
-            this.set_position(tgt.x, tgt.y);
-            this.set_size(preSize.width * scale, preSize.height * scale);
-        }
-    }
-
-    animateToPosition(duration) {
-        if (this._destroyed) return;
-        const tgt = WindowState.get(this._window, MINIATURE_TARGET_POS);
-        const scale = WindowState.get(this._window, MINIATURE_SCALE);
-        const preSize = WindowState.get(this._window, PRE_MINIATURE_SIZE);
-
-        if (tgt && scale && preSize) {
-            this.remove_all_transitions();
-            this.ease({
-                x: tgt.x,
-                y: tgt.y,
-                duration,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            });
-            this.set_size(preSize.width * scale, preSize.height * scale);
-        }
+        this.set_position(x, y);
+        this.set_size(width, height);
+        if (!this._icon) return;
+        const [allocW, allocH] = this.allocation.get_size();
+        this._icon.set_translation((width - allocW) / 2, (height - allocH) / 2, 0);
     }
 
     showIcon(duration) {
@@ -298,26 +306,18 @@ const MiniatureClickOverlay = GObject.registerClass({
         });
     }
 
-    flyIconIn(dx, dy, duration) {
+    // The enforce effect carries the icon with the frame; only the delayed fade is ours.
+    flyIconIn(duration) {
         if (this._destroyed || !this._icon) return;
         this._cancelIconDelay();
         this._icon.remove_all_transitions();
 
         if (duration <= 0) {
-            this._icon.set_translation(0, 0, 0);
             this.showIcon(0);
             return;
         }
 
         this._icon.opacity = 0;
-        this._icon.set_translation(dx, dy, 0);
-        this._icon.ease({
-            translation_x: 0,
-            translation_y: 0,
-            duration,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-        });
-
         const fadeDelay = Math.round(duration * constants.MINIATURE_ICON_FADE_START);
         this._iconDelayId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, fadeDelay, () => {
             this._iconDelayId = 0;
@@ -336,7 +336,6 @@ const MiniatureClickOverlay = GObject.registerClass({
         if (this._destroyed || !this._icon) return;
         this._cancelIconDelay();
         this._icon.remove_all_transitions();
-        this._icon.set_translation(0, 0, 0);
         this._icon.opacity = 0;
     }
 
@@ -408,8 +407,9 @@ export const MiniatureManager = GObject.registerClass({
         this._animationsManager = animationsManager;
     }
 
-    // Shared onStopped for both shrink paths: clear anim flags and re-apply the latest
-    // target, since the layout may have recomputed the slot while the ease ran.
+    // Layout may have recomputed the slot while the ease ran; the final onStopped
+    // has to re-apply the freshly written target instead of leaving the actor on a
+    // stale position.
     _finishMiniatureAnim(window, windowActor) {
         WindowState.remove(window, ANIMATING_MINIATURE);
         WindowState.remove(window, MINIATURE_ANIM_KIND);
@@ -418,11 +418,8 @@ export const MiniatureManager = GObject.registerClass({
 
         const finalTgt = WindowState.get(window, MINIATURE_TARGET_POS);
         const finalSc = WindowState.get(window, MINIATURE_SCALE);
-        const finalExtL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-        const finalExtT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-        if (finalTgt && finalSc) {
-            applyMiniatureActorState(windowActor, finalSc, finalExtL, finalExtT, finalTgt.x, finalTgt.y);
-        }
+        if (finalTgt && finalSc)
+            applyMiniatureActorState(windowActor, finalSc, finalTgt.x, finalTgt.y);
         const [finalAx, finalAy] = windowActor.get_position();
         const [finalW, finalH] = windowActor.get_size();
         Logger.log(`[MINIATURE] createMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH}) scale=${finalSc} FINAL_VISUAL=${Math.round(finalW * finalSc)}x${Math.round(finalH * finalSc)}`);
@@ -431,7 +428,7 @@ export const MiniatureManager = GObject.registerClass({
     // Shrinking straight out of an interrupted restore: pick up the actor's live scale and
     // translation so the flight starts from what's on screen, not from a full-size frame.
     _animateMiniatureFromRestore(window, windowActor, ctx) {
-        const { scale, targetX, targetY, extLeft, extTop, actorBefore_x, actorBefore_y, currentFrame, endCenterX, endCenterY } = ctx;
+        const { scale, targetX, targetY, extLeft, extTop, actorBefore_x, actorBefore_y } = ctx;
         const [actorW, actorH] = windowActor.get_size();
 
         const [cpx, cpy] = windowActor.get_pivot_point();
@@ -445,13 +442,6 @@ export const MiniatureManager = GObject.registerClass({
         const endTx = targetX - actorBefore_x - extLeft * scale;
         const endTy = targetY - actorBefore_y - extTop * scale;
         const animDuration = Math.max(1, Math.round(constants.MINIATURE_ANIM_MS * getSlowDownFactor() * (cs - scale) / Math.max(0.001, 1.0 - scale)));
-
-        // Frame is already shrunk to cs here, so its center rides that scale.
-        const iconFly = {
-            dx: visualX + currentFrame.width * cs / 2 - endCenterX,
-            dy: visualY + currentFrame.height * cs / 2 - endCenterY,
-            duration: animDuration,
-        };
 
         // Set kind before remove_all_transitions, since restore's onStopped fires
         // synchronously and needs to see 'create' to skip its conditional removal.
@@ -473,11 +463,11 @@ export const MiniatureManager = GObject.registerClass({
             onStopped: () => this._finishMiniatureAnim(window, windowActor),
         });
 
-        return iconFly;
+        return animDuration;
     }
 
     _animateMiniatureFresh(window, windowActor, ctx) {
-        const { scale, targetX, targetY, extLeft, extTop, actorBefore_x, actorBefore_y, currentFrame, endCenterX, endCenterY } = ctx;
+        const { scale, targetX, targetY, extLeft, extTop, actorBefore_x, actorBefore_y } = ctx;
         const [actorW, actorH] = windowActor.get_size();
 
         WindowState.set(window, MINIATURE_ANIM_KIND, 'create');
@@ -489,12 +479,7 @@ export const MiniatureManager = GObject.registerClass({
         const py = dh > 0 ? Math.max(0, Math.min(1, (targetY - actorBefore_y - extTop * scale) / dh)) : 0;
         const tx = targetX - actorBefore_x - px * dw - extLeft * scale;
         const ty = targetY - actorBefore_y - py * dh - extTop * scale;
-
-        const iconFly = {
-            duration: Math.ceil(constants.MINIATURE_ANIM_MS * getSlowDownFactor()),
-            dx: currentFrame.x + currentFrame.width / 2 - endCenterX,
-            dy: currentFrame.y + currentFrame.height / 2 - endCenterY,
-        };
+        const animDuration = Math.ceil(constants.MINIATURE_ANIM_MS * getSlowDownFactor());
 
         windowActor.remove_all_transitions();
         windowActor.set_pivot_point(px, py);
@@ -505,66 +490,59 @@ export const MiniatureManager = GObject.registerClass({
             scale_y: scale,
             translation_x: tx,
             translation_y: ty,
-            duration: iconFly.duration,
+            duration: animDuration,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onStopped: () => this._finishMiniatureAnim(window, windowActor),
         });
 
-        return iconFly;
+        return animDuration;
     }
 
-    createMiniature(window, computedSlot, forcedPreSize = null, { animate = true } = {}) {
+    createMiniature(window, region, forcedPreSize = null, { animate = true } = {}) {
         const windowActor = window.get_compositor_private();
         if (!windowActor) return false;
 
         this._animationsManager?.removeAnimatingWindow(window.get_id());
 
-        const { preSize, scale, targetX, targetY, actorBefore_x, actorBefore_y, currentFrame, extLeft, extTop } =
-            this._computeMiniatureGeometry(window, windowActor, computedSlot, forcedPreSize);
+        const { scale, targetX, targetY, actorBefore_x, actorBefore_y, currentFrame, extLeft, extTop } =
+            this._computeMiniatureGeometry(window, windowActor, region, forcedPreSize);
 
-        this._storeMiniatureState(window, windowActor, { scale, preSize, targetX, targetY, extLeft, extTop });
+        this._storeMiniatureState(window, windowActor, { scale, extLeft, extTop, targetX, targetY });
 
-        // BinLayout gives icon center for free once flight translation reaches zero.
-        const endCenterX = targetX + preSize.width * scale / 2;
-        const endCenterY = targetY + preSize.height * scale / 2;
-        let iconFly = { dx: 0, dy: 0, duration: 0 };
+        let fadeDuration = 0;
 
         if (animate) {
-            const ctx = { scale, targetX, targetY, extLeft, extTop, actorBefore_x, actorBefore_y, currentFrame, endCenterX, endCenterY };
+            const ctx = { scale, targetX, targetY, extLeft, extTop, actorBefore_x, actorBefore_y };
             WindowState.set(window, ANIMATING_MINIATURE, true);
 
             if (WindowState.get(window, MINIATURE_ANIM_KIND) === 'restore') {
-                iconFly = this._animateMiniatureFromRestore(window, windowActor, ctx);
+                fadeDuration = this._animateMiniatureFromRestore(window, windowActor, ctx);
             } else {
-                iconFly = this._animateMiniatureFresh(window, windowActor, ctx);
+                fadeDuration = this._animateMiniatureFresh(window, windowActor, ctx);
             }
         } else {
             // Instant: apply transforms synchronously so the overview's frozen
             // slot (already set to mini) matches the actor state from the first frame.
-            applyMiniatureActorState(windowActor, scale, extLeft, extTop, targetX, targetY);
+            applyMiniatureActorState(windowActor, scale, targetX, targetY);
         }
 
-        Logger.log(`[MINIATURE] createMiniature ${window.get_id()}: miniSize=${Math.round(preSize.width * scale)}x${Math.round(preSize.height * scale)}`);
+        Logger.log(`[MINIATURE] createMiniature ${window.get_id()}: miniSize=${Math.round(currentFrame.width * scale)}x${Math.round(currentFrame.height * scale)}`);
 
         this._armMiniatureFocusGuard(window);
 
         this._miniatureWindows.set(window.get_id(), window);
         this.emit('miniature-created', window);
 
-        this._attachMiniatureOverlay(window, windowActor, iconFly, animate);
+        this._attachMiniatureOverlay(window, windowActor, fadeDuration, animate);
 
         Logger.log(`[MINIATURE] Created miniature for ${window.get_id()}, scale=${scale.toFixed(4)}`);
         return true;
     }
 
-    _computeMiniatureGeometry(window, windowActor, computedSlot, forcedPreSize) {
+    _computeMiniatureGeometry(window, windowActor, region, forcedPreSize) {
         const preSize = forcedPreSize || window.get_frame_rect();
-        const scale = constants.MINIATURE_TARGET_SIZE_PX / Math.max(preSize.width, preSize.height);
-        Logger.log(`[MINIATURE] createMiniature ${window.get_id()}: preSize=${preSize.width}x${preSize.height} scale=${scale} forced=${!!forcedPreSize}`);
 
-        const targetX = computedSlot.x;
-        const targetY = computedSlot.y;
-
+        const [actorWidth, actorHeight] = windowActor.get_size();
         const [actorBefore_x, actorBefore_y] = windowActor.get_position();
         const currentFrame = window.get_frame_rect();
 
@@ -573,16 +551,25 @@ export const MiniatureManager = GObject.registerClass({
         const bufferRect = window.get_buffer_rect();
         const extLeft = currentFrame.x - bufferRect.x;
         const extTop = currentFrame.y - bufferRect.y;
-        Logger.log(`[MINIATURE] createMiniature ${window.get_id()} (${window.get_wm_class?.() ?? '?'}): preFrame=(${preSize.x},${preSize.y} ${preSize.width}x${preSize.height}) slot=${Math.round(preSize.width * scale)}x${Math.round(preSize.height * scale)} currentFrame=(${currentFrame.x},${currentFrame.y} ${currentFrame.width}x${currentFrame.height}) actorBefore=(${actorBefore_x},${actorBefore_y}) target=(${targetX},${targetY}) scale=${scale.toFixed(4)} extLeft=${extLeft} extTop=${extTop}`);
 
-        return { preSize, scale, targetX, targetY, actorBefore_x, actorBefore_y, currentFrame, extLeft, extTop };
+        const scale = miniatureScaleToFit(window, region);
+        Logger.log(`[MINIATURE] createMiniature ${window.get_id()}: preSize=${preSize.width}x${preSize.height} actorSize=${actorWidth}x${actorHeight} region=(${region.width}x${region.height}) scale=${scale} forced=${!!forcedPreSize}`);
+
+        const targetX = region.x;
+        const targetY = region.y;
+
+        Logger.log(`[MINIATURE] createMiniature ${window.get_id()} (${window.get_wm_class?.() ?? '?'}): preFrame=(${preSize.x},${preSize.y} ${preSize.width}x${preSize.height}) slot=${Math.round(currentFrame.width * scale)}x${Math.round(currentFrame.height * scale)} currentFrame=(${currentFrame.x},${currentFrame.y} ${currentFrame.width}x${currentFrame.height}) actorBefore=(${actorBefore_x},${actorBefore_y}) target=(${targetX},${targetY}) scale=${scale.toFixed(4)} extLeft=${extLeft} extTop=${extTop}`);
+
+        return { scale, targetX, targetY, actorBefore_x, actorBefore_y, currentFrame, extLeft, extTop };
     }
 
-    _storeMiniatureState(window, windowActor, { scale, preSize, targetX, targetY, extLeft, extTop }) {
+    _storeMiniatureState(window, windowActor, { scale, extLeft, extTop, targetX, targetY }) {
         // Store before animation; enforce effect + workspace patch read these during anim.
         WindowState.set(window, IS_MINIATURE, true);
         WindowState.set(window, MINIATURE_SCALE, scale);
-        WindowState.set(window, PRE_MINIATURE_SIZE, { width: preSize.width, height: preSize.height });
+        // The live frame scale was fitted against; getMiniatureSize and every reshrink scale off it.
+        const frame = window.get_frame_rect();
+        WindowState.set(window, PRE_MINIATURE_SIZE, { width: frame.width, height: frame.height });
         WindowState.set(window, MINIATURE_TARGET_POS, { x: targetX, y: targetY });
         WindowState.set(window, MINIATURE_EXT_LEFT, extLeft);
         WindowState.set(window, MINIATURE_EXT_TOP, extTop);
@@ -610,14 +597,94 @@ export const MiniatureManager = GObject.registerClass({
         WindowState.set(window, 'miniatureJustMiniaturizedTimeoutId', timeoutId);
     }
 
-    _attachMiniatureOverlay(window, windowActor, iconFly, animate) {
+    _attachMiniatureOverlay(window, windowActor, fadeDuration, animate) {
         const overlay = new MiniatureClickOverlay(window, this);
         global.window_group.insert_child_above(overlay, windowActor);
         WindowState.set(window, MINIATURE_OVERLAY, overlay);
 
-        // Ease is already running on the same frame clock; icon still lands with it.
-        overlay.flyIconIn(iconFly.dx, iconFly.dy, animate ? iconFly.duration : 0);
+        overlay.flyIconIn(animate ? fadeDuration : 0);
         if (this._overviewActive) overlay.setIconSuppressed('overview', true);
+    }
+
+    // Shrinks an already-miniaturized window further in place: same actor, same overlay,
+    // just a smaller scale. No-op if the window isn't currently a miniature.
+    reshrinkMiniature(window, region) {
+        if (!WindowState.get(window, IS_MINIATURE)) return false;
+
+        const windowActor = window.get_compositor_private();
+        if (!windowActor) return false;
+
+        this._animationsManager?.removeAnimatingWindow(window.get_id());
+
+        const scale = miniatureScaleToFit(window, region);
+        const targetX = region.x;
+        const targetY = region.y;
+        const { tx, ty } = frameTranslation(windowActor, scale, targetX, targetY);
+
+        // Removing transitions fires the create ease's onStopped synchronously, which snaps the
+        // actor to its final state; capture the live transform first so the ease resumes from it.
+        const [actorW, actorH] = windowActor.get_size();
+        const [px, py] = windowActor.get_pivot_point();
+        const liveScale = windowActor.scale_x;
+        const liveTx = windowActor.translation_x + px * actorW * (1 - liveScale);
+        const liveTy = windowActor.translation_y + py * actorH * (1 - liveScale);
+
+        windowActor.remove_all_transitions();
+        windowActor.set_pivot_point(0, 0);
+        windowActor.set_scale(liveScale, liveScale);
+        windowActor.set_translation(liveTx, liveTy, 0);
+        // Without the flag the enforce effect writes the final transform on the next paint, and
+        // that direct write drops this ease.
+        WindowState.set(window, ANIMATING_MINIATURE, true);
+        windowActor.ease({
+            scale_x: scale,
+            scale_y: scale,
+            translation_x: tx,
+            translation_y: ty,
+            duration: constants.MINIATURE_ANIM_MS,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onStopped: (isFinished) => {
+                if (!isFinished) return;
+                WindowState.remove(window, ANIMATING_MINIATURE);
+                const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
+                const sc = WindowState.get(window, MINIATURE_SCALE);
+                if (tgt && sc) applyMiniatureActorState(windowActor, sc, tgt.x, tgt.y);
+            },
+        });
+
+        WindowState.set(window, MINIATURE_SCALE, scale);
+        WindowState.set(window, MINIATURE_TARGET_POS, { x: targetX, y: targetY });
+
+        const size = getMiniatureSize(window);
+        WindowState.get(window, MINIATURE_OVERLAY)?.set_size(size.width, size.height);
+
+        Logger.log(`[MINIATURE] reshrinkMiniature ${window.get_id()}: scale=${scale.toFixed(4)} size=${size.width}x${size.height}`);
+        return true;
+    }
+
+    // Every size reader scales from PRE_MINIATURE_SIZE, so it follows a late frame or the desktop,
+    // layout and overview disagree. Returns whether anything moved.
+    refitToFrame(window) {
+        const preSize = WindowState.get(window, PRE_MINIATURE_SIZE);
+        const frame = window.get_frame_rect();
+        if (!preSize || (Math.abs(frame.width - preSize.width) <= 2 && Math.abs(frame.height - preSize.height) <= 2)) return false;
+
+        const slot = getMiniatureSize(window);
+        const scale = Math.min(slot.width / frame.width, slot.height / frame.height);
+        WindowState.set(window, PRE_MINIATURE_SIZE, { width: frame.width, height: frame.height });
+        WindowState.set(window, MINIATURE_SCALE, scale);
+        Logger.log(`[MINIATURE] refitToFrame ${window.get_id()}: frame ${preSize.width}x${preSize.height} -> ${frame.width}x${frame.height}, scale=${scale.toFixed(4)}`);
+
+        // Frozen paths (overview, screenshot pause) skip paint tracking; keep their box current.
+        const freshSize = getMiniatureSize(window);
+        WindowState.get(window, MINIATURE_OVERLAY)?.set_size(freshSize.width, freshSize.height);
+
+        // A running ease lands on MINIATURE_SCALE when it finishes, so it picks this up itself.
+        const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
+        const actor = window.get_compositor_private();
+        if (actor && tgt && !WindowState.get(window, ANIMATING_MINIATURE))
+            applyMiniatureActorState(actor, scale, tgt.x, tgt.y);
+        return true;
     }
 
     restoreMiniature(window, _newSlot, { activate = true } = {}) {
@@ -720,34 +787,11 @@ export const MiniatureManager = GObject.registerClass({
         // already handed off to whatever interrupted us by this point.
         const continueScaleUp = (isFinished) => {
             if (!windowActor || windowActor.is_destroyed()) return;
-
             if (!isFinished) {
-                if (WindowState.get(window, IS_MINIATURE)) return;
-                if (Math.abs(windowActor.scale_x - 1.0) < 0.001 && Math.abs(windowActor.scale_y - 1.0) < 0.001) {
-                    if (WindowState.get(window, MINIATURE_ANIM_KIND) === 'restore')
-                        WindowState.remove(window, MINIATURE_ANIM_KIND);
-                    return;
-                }
-                windowActor.ease({
-                    scale_x: 1.0,
-                    scale_y: 1.0,
-                    duration,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                    onStopped: continueScaleUp,
-                });
+                this._resumeInterruptedRestore(window, windowActor, duration, continueScaleUp);
                 return;
             }
-
-            if (WindowState.get(window, MINIATURE_ANIM_KIND) === 'restore')
-                WindowState.remove(window, MINIATURE_ANIM_KIND);
-            if (!WindowState.get(window, IS_MINIATURE)) {
-                windowActor.set_pivot_point(0, 0);
-                windowActor.set_scale(1.0, 1.0);
-                windowActor.set_translation(0, 0, 0);
-            }
-            const [finalAx, finalAy] = windowActor.get_position();
-            const [finalW, finalH] = windowActor.get_size();
-            Logger.log(`[MINIATURE] restoreMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH})`);
+            this._finishRestoreScaleUp(window, windowActor);
         };
 
         windowActor.ease({
@@ -759,6 +803,127 @@ export const MiniatureManager = GObject.registerClass({
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onStopped: continueScaleUp,
         });
+
+        // A concurrent smart resize (a sibling squeezing back in) can land a different
+        // real frame under this same actor while the ease above is still running.
+        // scale=1.0 always means "the actor's current native size", so when that native
+        // size changes mid-ease, the on-screen box jumps the instant the new buffer
+        // commits instead of continuing to interpolate. Re-anchor the moment that lands.
+        this._attachRestoreRaceGuard(window, windowActor, { actorW, actorH, extL, extT, duration, continueScaleUp });
+    }
+
+    // A retile can interrupt this mid-flight (it shares the actor with animateWindow's
+    // own position ease). Rather than snap to full size, pick the scale-up back up from
+    // wherever it got cut off; position is already handed off to whatever interrupted us.
+    _resumeInterruptedRestore(window, windowActor, duration, continueScaleUp) {
+        // The race guard's own remove_all_transitions() triggers this same callback with
+        // isFinished=false before it's had a chance to set the rebased scale/translation
+        // itself; racing a second "pick back up" ease against that rebase is exactly the
+        // kind of scale-property fight this whole mechanism exists to avoid, so stand
+        // down and let it finish.
+        if (WindowState.get(window, 'restoreRaceGuardRebasing')) return;
+        if (WindowState.get(window, IS_MINIATURE)) return;
+        if (Math.abs(windowActor.scale_x - 1.0) < 0.001 && Math.abs(windowActor.scale_y - 1.0) < 0.001) {
+            if (WindowState.get(window, MINIATURE_ANIM_KIND) === 'restore')
+                WindowState.remove(window, MINIATURE_ANIM_KIND);
+            this._detachRestoreRaceGuard(window, windowActor);
+            return;
+        }
+        windowActor.ease({
+            scale_x: 1.0,
+            scale_y: 1.0,
+            duration,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onStopped: continueScaleUp,
+        });
+    }
+
+    _finishRestoreScaleUp(window, windowActor) {
+        if (WindowState.get(window, MINIATURE_ANIM_KIND) === 'restore')
+            WindowState.remove(window, MINIATURE_ANIM_KIND);
+        this._detachRestoreRaceGuard(window, windowActor);
+        if (!WindowState.get(window, IS_MINIATURE)) {
+            windowActor.set_pivot_point(0, 0);
+            windowActor.set_scale(1.0, 1.0);
+            windowActor.set_translation(0, 0, 0);
+        }
+        const [finalAx, finalAy] = windowActor.get_position();
+        const [finalW, finalH] = windowActor.get_size();
+        Logger.log(`[MINIATURE] restoreMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH})`);
+    }
+
+    // See the comment above the call site for why this exists. Meta.Window's own
+    // 'size-changed' fires on the logical frame well before the actor's real pixel
+    // allocation catches up, so this watches the actor's own reallocation instead,
+    // reusing the "preserve the visual box" math animations.js's
+    // _computeInitialTransform relies on for ordinary resizes.
+    _attachRestoreRaceGuard(window, windowActor, { actorW, actorH, extL, extT, duration, continueScaleUp }) {
+        this._detachRestoreRaceGuard(window, windowActor);
+        let lastActorW = actorW;
+        let lastActorH = actorH;
+
+        const guardId = windowActor.connect('notify::allocation', () => {
+            if (!windowActor || windowActor.is_destroyed()) return;
+            if (WindowState.get(window, MINIATURE_ANIM_KIND) !== 'restore') return;
+
+            const [newActorW, newActorH] = windowActor.get_size();
+            if (Math.abs(newActorW - lastActorW) < 2 && Math.abs(newActorH - lastActorH) < 2) return;
+
+            const [ax, ay] = windowActor.get_position();
+            const [cpx, cpy] = windowActor.get_pivot_point();
+            const curScaleX = windowActor.scale_x;
+            const curScaleY = windowActor.scale_y;
+            const curTx = windowActor.translation_x;
+            const curTy = windowActor.translation_y;
+
+            // Absolute on-screen position of the logical (CSD-margin-excluded) content
+            // right now, against the actor size this ease was last baselined on.
+            const visualX = ax + cpx * lastActorW * (1 - curScaleX) + curTx + extL * curScaleX;
+            const visualY = ay + cpy * lastActorH * (1 - curScaleY) + curTy + extT * curScaleY;
+            const newScaleX = newActorW > 0 ? (lastActorW * curScaleX) / newActorW : curScaleX;
+            const newScaleY = newActorH > 0 ? (lastActorH * curScaleY) / newActorH : curScaleY;
+
+            // remove_all_transitions fires continueScaleUp(isFinished=false) synchronously,
+            // before this handler has set the rebased scale/translation; the flag tells it
+            // to stand down instead of racing its own "pick back up" ease against this one.
+            WindowState.set(window, 'restoreRaceGuardRebasing', true);
+            windowActor.remove_all_transitions();
+            windowActor.set_pivot_point(0, 0);
+            windowActor.set_scale(newScaleX, newScaleY);
+            windowActor.set_translation(visualX - ax - extL * newScaleX, visualY - ay - extT * newScaleY, 0);
+
+            Logger.log(`[MINIATURE] restore race guard rebased ${window.get_id()}: actor ${lastActorW}x${lastActorH} -> ${newActorW}x${newActorH}, scale ${curScaleX.toFixed(3)},${curScaleY.toFixed(3)} -> ${newScaleX.toFixed(3)},${newScaleY.toFixed(3)}`);
+
+            lastActorW = newActorW;
+            lastActorH = newActorH;
+
+            windowActor.ease({
+                scale_x: 1.0,
+                scale_y: 1.0,
+                translation_x: 0,
+                translation_y: 0,
+                duration,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onStopped: continueScaleUp,
+            });
+            WindowState.remove(window, 'restoreRaceGuardRebasing');
+        });
+
+        WindowState.set(window, 'restoreRaceGuardId', guardId);
+    }
+
+    _detachRestoreRaceGuard(window, windowActor) {
+        const guardId = WindowState.get(window, 'restoreRaceGuardId');
+        if (guardId === undefined) return;
+        WindowState.remove(window, 'restoreRaceGuardId');
+        if (!windowActor) return;
+        // The actor can already be fully disposed by the time this runs, not just
+        // Clutter-destroyed, so disconnect throws instead of returning cleanly.
+        try {
+            if (!windowActor.is_destroyed()) windowActor.disconnect(guardId);
+        } catch (_e) {
+            // Already gone; nothing to disconnect.
+        }
     }
 
     // Snapshot before clearing; layout scorer uses this to pull window back near its slot.
@@ -773,13 +938,14 @@ export const MiniatureManager = GObject.registerClass({
     }
 
     _clearMiniatureState(window) {
+        WindowState.remove(window, ANIMATING_MINIATURE);
         WindowState.remove(window, MINIATURE_SCALE);
         WindowState.remove(window, PRE_MINIATURE_SIZE);
         WindowState.remove(window, MINIATURE_TARGET_POS);
         WindowState.remove(window, MINIATURE_EXT_LEFT);
         WindowState.remove(window, MINIATURE_EXT_TOP);
-        // Stale mini-target persists when min size blocks tryFitWithResize; clear so next layout
-        // doesn't use obsolete mini size.
+        // A shrink target left from before the window was a thumbnail is stale by now; the next
+        // layout would pack it instead of the restored size.
         WindowState.remove(window, 'targetSmartResizeSize');
 
         const timeoutId = WindowState.get(window, 'miniatureJustMiniaturizedTimeoutId');
@@ -792,6 +958,7 @@ export const MiniatureManager = GObject.registerClass({
         const windowActor = window.get_compositor_private();
 
         WindowState.remove(window, IS_MINIATURE);
+        WindowState.remove(window, ANIMATING_MINIATURE);
         WindowState.remove(window, MINIATURE_SCALE);
         WindowState.remove(window, PRE_MINIATURE_SIZE);
         WindowState.remove(window, MINIATURE_TARGET_POS);
@@ -883,10 +1050,8 @@ export const MiniatureManager = GObject.registerClass({
             const actor = window.get_compositor_private();
             const scale = WindowState.get(window, MINIATURE_SCALE);
             const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
-            const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-            const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
             if (actor && scale && tgt)
-                applyMiniatureActorState(actor, scale, extL, extT, tgt.x, tgt.y);
+                applyMiniatureActorState(actor, scale, tgt.x, tgt.y);
         }
     }
 
@@ -907,14 +1072,9 @@ export const MiniatureManager = GObject.registerClass({
         if (this._miniatureWindows.size === 0) return null;
         for (const window of this._miniatureWindows.values()) {
             const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
-            const scale = WindowState.get(window, MINIATURE_SCALE);
-            const preSize = WindowState.get(window, PRE_MINIATURE_SIZE);
-            if (!tgt || !scale || !preSize) continue;
-            const ox = tgt.x;
-            const oy = tgt.y;
-            const ow = preSize.width * scale;
-            const oh = preSize.height * scale;
-            if (x >= ox && x <= ox + ow && y >= oy && y <= oy + oh)
+            const size = getMiniatureSize(window);
+            if (!tgt || !size) continue;
+            if (x >= tgt.x && x <= tgt.x + size.width && y >= tgt.y && y <= tgt.y + size.height)
                 return window;
         }
         return null;

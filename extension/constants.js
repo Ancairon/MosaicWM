@@ -81,6 +81,8 @@ export const ABSOLUTE_MIN_HEIGHT = 100;
 
 export const EDGE_TILING_THRESHOLD = 10;
 
+export const REFUSAL_SHAKE_MS = 300;
+
 export const POLL_INTERVAL_MS = 50;
 export const DEBOUNCE_DELAY_MS = 500;
 export const RETILE_DELAY_MS = 100;
@@ -88,9 +90,10 @@ export const GEOMETRY_CHECK_DELAY_MS = 10;
 export const SAFETY_TIMEOUT_BUFFER_MS = 100;
 export const EDGE_TILE_RESTORE_DELAY_MS = 300;  // Delay to prevent false overflow during edge tile restoration
 export const GEOMETRY_WAIT_MAX_ATTEMPTS = 100;   // Max attempts to wait for window geometry (100 * 10ms = 1s)
-export const REVERSE_RESIZE_PROTECTION_MS = 1000; // Protection window for reverse smart resize/unmaximize/overflow
+export const REVERSE_RESIZE_PROTECTION_MS = 1000; // Protection window after a resize, unmaximize or overflow settles
 export const RESIZE_SETTLE_DELAY_MS = 150;       // Delay to let Mutter apply resize before retiling
 export const RESIZE_SETTLE_MAX_ATTEMPTS = 4;     // Settle checks before the restored-size bridge is dropped anyway
+export const RESIZE_SETTLE_TILE_THROTTLE_MS = 30; // Spacing between settle-path retiles; the settle path fires per ack
 export const EDGE_TILE_EXIT_SUPPRESSION_MS = RETILE_DELAY_MS + RESIZE_SETTLE_DELAY_MS; // Matches removeTile's targetRestoredSize bridge
 export const RESIZE_CLAMP_SETTLE_WINDOW_MS = 1500; // Window age below which a clamp is treated as the client still settling
 export const RESIZE_CLAMP_VERIFY_DELAY_MS = 400; // Quiet time after a deferred clamp before the frame is committed as real
@@ -109,6 +112,8 @@ export const ANIMATION_DIFF_THRESHOLD = 10;
 // Slack for recognizing a committed size as the ease's own echo; beyond it, the
 // size is one the client picked for itself.
 export const EASE_TARGET_TOLERANCE_PX = 2;
+// A sibling gets a commit per tick during a manual resize, so the ack that lands can be a few behind.
+export const REQUESTED_SIZE_HISTORY = 4;
 
 // Fallback when get_min_size() has no hint
 export const SMART_RESIZE_MIN_WINDOW_WIDTH = 100;
@@ -120,6 +125,17 @@ export const SLIDE_IN_FAILSAFE_MS = 1000;     // Re-check interval if a window's
 export const QUEUE_PROCESS_DELAY_MS = 100;   // Delay between processing window opening queue items (Mutter settling)
 
 export const MINIATURE_TARGET_SIZE_PX = 256;  // Longest side of a miniaturized window
+export const MINIATURE_MAX_SCALE = 0.9;  // Scale above which a thumbnail is barely smaller than its window
+// With 2 the least recent window moves three times as fast along its axis as the most recent,
+// so it's the first to cross into a thumbnail.
+export const ALLOCATOR_MRU_RATE_SLOPE = 2;
+// Dead band between becoming a thumbnail and coming back; without it a window parked on the
+// threshold flips on every few px of rounding.
+export const MINIATURE_RESTORE_HYSTERESIS_PX = 24;
+export const ALLOCATOR_RESIZE_THROTTLE_MS = 100;  // A live resize keeps the last allocation this long while it still fits
+// The size allocator bisects its scale; a few px of slack left on the table is imperceptible,
+// so this trades exact-pixel convergence for fewer _tile() probes.
+export const FIT_SCALE_SEARCH_TOLERANCE_PX = 8;
 export const MINIATURE_ICON_SIZE_PX = 64;     // Same size the Overview uses, so the icon can hand off without resizing
 export const MINIATURE_ICON_FADE_START = 0.5;  // Point in the icon's flight where it starts fading in; a fraction since an interrupted restore shortens the flight
 export const MINIATURE_ICON_FADE_OUT_MS = 90;  // Window is growing back underneath, so the icon has to clear out fast

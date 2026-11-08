@@ -10,6 +10,8 @@ import * as constants from './constants.js';
 import * as WindowState from './windowState.js';
 import { MINIATURE_ANIM_KIND } from './windowState.js';
 import { getAnimationsEnabled, getSlowDownFactor } from './timing.js';
+import { MosaicConstraints } from './mosaicConstraint.js';
+import { followResize } from './resizeFollower.js';
 
 import GObject from 'gi://GObject';
 
@@ -29,12 +31,35 @@ export const AnimationsManager = GObject.registerClass({
         this._animatingWindows = new Map(); // Window ID -> actor, drives animations-completed signal
         this._animatingTargets = new Map(); // Window ID -> last targetRect, to detect redundant retile calls
         this._pendingEntranceEases = new Map(); // Window ID -> ease params, for entrances deferred until the actor is mapped
+        this._resizeFollowers = new Map(); // Window ID -> follower keeping a slow client's actor at its slot
         this._justEndedDrag = false;
         this._resizingWindowId = null;
         this._timeoutRegistry = null;
         this._isOverviewActive = false;
         // Toggled by setMembershipChangeBounce around a close-triggered retile pass.
         this._membershipChangeBounce = false;
+    }
+
+    // Runs even with animations off: it's the only signal that the drop will be refused, and
+    // honouring the preference here would turn the refusal into nothing happening at all.
+    shakeRefusal(actor) {
+        if (!actor || actor.is_destroyed?.()) return;
+
+        // home has to be a resting value. While another ease owns translation_x, reading it
+        // would capture a frame and the hops below would park the actor on that frame.
+        if (actor.get_transition('translation-x')) return;
+
+        const step = Math.ceil(constants.REFUSAL_SHAKE_MS / 4);
+        const home = actor.translation_x;
+
+        const hop = (dx, next) => actor.ease({
+            translation_x: home + dx,
+            duration: step,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: next,
+        });
+
+        hop(-8, () => hop(8, () => hop(-4, () => hop(0, null))));
     }
 
     setMembershipChangeBounce(active) {
@@ -45,7 +70,9 @@ export const AnimationsManager = GObject.registerClass({
         this._timeoutRegistry = registry;
     }
 
+    // The pointer owns the size from here, so a follower still holding the old slot would fight it.
     setResizingWindow(windowId) {
+        if (windowId !== null) this._cancelResizeFollower(windowId, { resetScale: true });
         this._resizingWindowId = windowId;
     }
 
@@ -77,7 +104,6 @@ export const AnimationsManager = GObject.registerClass({
         }
     }
 
-    // Used by async utilities to wait for animations to complete
     hasActiveAnimations() {
         this._pruneStaleAnimations();
         return this._animatingWindows.size > 0;
@@ -102,6 +128,7 @@ export const AnimationsManager = GObject.registerClass({
                 return GLib.SOURCE_REMOVE;
             }, 'animations_dragEndDebounce');
         }
+        if (dragging) this._cancelAllResizeFollowers({ resetScale: true });
         this._isDragging = dragging;
     }
 
@@ -144,13 +171,17 @@ export const AnimationsManager = GObject.registerClass({
         const { duration, mode, onComplete, draggedWindow, subtle, userOp, firstPlacement, slideInOffset, allowDuringResize } =
             this._animOptions(options);
 
+        // These paths move the frame without an ease to re-aim a follower, so one still holding an
+        // earlier slot would draw the window at the wrong size.
         if (!this.shouldAnimateWindow(window, draggedWindow, allowDuringResize)) {
+            this._cancelResizeFollower(window.get_id(), { resetScale: true });
             this._applyWithoutAnimation(window, targetRect, { userOp, firstPlacement, onComplete });
             return;
         }
 
         const windowActor = window.get_compositor_private();
         if (!windowActor) {
+            this._cancelResizeFollower(window.get_id());
             this._applyNoActor(window, targetRect, { firstPlacement, onComplete });
             return;
         }
@@ -176,6 +207,7 @@ export const AnimationsManager = GObject.registerClass({
         // remove_all_transitions fires old onStopped(isFinished=false);
         // the guard at the ease callback returns early without double cleanup.
         windowActor.remove_all_transitions();
+        this._cancelResizeFollower(window.get_id());
 
         this._animatingWindows.set(window.get_id(), windowActor);
         // skipScale rides along so a later call to the same target, once skipScale
@@ -213,8 +245,7 @@ export const AnimationsManager = GObject.registerClass({
         // by the time set_translation reads it below, regardless of how long the
         // resize itself takes to land. The size mismatch in the meantime is already
         // covered by the scale animation below, which doesn't depend on this.
-        window.move_frame(userOp, targetRect.x, targetRect.y);
-        window.move_resize_frame(userOp, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
+        MosaicConstraints.moveThenCommit(window, targetRect, userOp);
 
         windowActor.set_translation(initialTx, initialTy, 0);
         if (!skipScale) {
@@ -222,7 +253,7 @@ export const AnimationsManager = GObject.registerClass({
             windowActor.set_scale(initialScaleX, initialScaleY);
         }
 
-        const easeParams = { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete };
+        const easeParams = { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete, targetRect };
 
         // Clutter silently skips implicit transitions on actors that aren't mapped yet
         // (should_skip_implicit_transition in clutter-actor.c) and just snaps to the
@@ -254,7 +285,7 @@ export const AnimationsManager = GObject.registerClass({
         }
 
         WindowState.set(window, 'isMosaicResizing', true);
-        window.move_resize_frame(userOp, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
+        MosaicConstraints.commitRegion(window, targetRect, userOp);
         this._clearMosaicResizingSoon(window);
         if (firstPlacement) {
             WindowState.remove(window, 'pendingFirstPlacement');
@@ -267,7 +298,7 @@ export const AnimationsManager = GObject.registerClass({
     _applyNoActor(window, targetRect, { firstPlacement, onComplete }) {
         Logger.log(`No actor for window ${window.get_id()}, skipping animation`);
         WindowState.set(window, 'isMosaicResizing', true);
-        window.move_resize_frame(false, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
+        MosaicConstraints.commitRegion(window, targetRect);
         this._clearMosaicResizingSoon(window);
         if (firstPlacement) WindowState.remove(window, 'pendingFirstPlacement');
         if (onComplete) onComplete();
@@ -318,7 +349,7 @@ export const AnimationsManager = GObject.registerClass({
     // Runs the actual translation/scale ease. Called either immediately from
     // animateWindow (actor already mapped) or later via runDeferredEntrance,
     // once windowHandler.js confirms the actor is mapped.
-    _runEntranceEase(window, windowActor, { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete }) {
+    _runEntranceEase(window, windowActor, { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete, targetRect }) {
         // Position keeps its own bounce; scale and opacity run as separate eases so
         // they can use a different curve. EASE_OUT_BACK overshoots past its target
         // and clamps there, so bundled into the same ease as translation it finishes
@@ -326,17 +357,9 @@ export const AnimationsManager = GObject.registerClass({
         // overshoots reads as a glitch, and a fade that overshoots reads as already
         // finished while the window is still visibly sliding.
         if (!skipScale) {
-            windowActor.ease({
-                scale_x: 1,
-                scale_y: 1,
-                duration: effectiveDuration,
-                mode: ANIMATION_MODE_SUBTLE,
-                onStopped: (isFinished) => {
-                    if (!isFinished) return;
-                    if (windowActor && !windowActor.is_destroyed())
-                        windowActor.set_scale(1, 1);
-                }
-            });
+            this._resizeFollowers.set(window.get_id(), followResize(window, windowActor, targetRect, {
+                duration: effectiveDuration, mode: ANIMATION_MODE_SUBTLE, registry: this._timeoutRegistry,
+            }));
         }
 
         // The map-time opacity=0 was only ever a placeholder until this real pass
@@ -428,7 +451,7 @@ export const AnimationsManager = GObject.registerClass({
             // the raw spawn position happens to already match the target, since it
             // owns clearing the opacity=0 onWindowAdded left it at and the slide-in offset.
             if (!needsMove && !isFirstPlacement) {
-                window.move_resize_frame(false, rect.x, rect.y, rect.width, rect.height);
+                MosaicConstraints.commitRegion(window, rect);
                 continue;
             }
 
@@ -490,7 +513,18 @@ export const AnimationsManager = GObject.registerClass({
         return this._animatingTargets.get(windowId) || null;
     }
 
+    _cancelResizeFollower(windowId, opts) {
+        this._resizeFollowers.get(windowId)?.cancel(opts);
+        this._resizeFollowers.delete(windowId);
+    }
+
+    _cancelAllResizeFollowers(opts) {
+        for (const id of [...this._resizeFollowers.keys()])
+            this._cancelResizeFollower(id, opts);
+    }
+
     removeAnimatingWindow(windowId) {
+        this._cancelResizeFollower(windowId);
         this._animatingTargets.delete(windowId);
         if (this._animatingWindows.delete(windowId)) {
             this._checkAllAnimationsComplete();
@@ -515,6 +549,7 @@ export const AnimationsManager = GObject.registerClass({
     }
 
     cleanup() {
+        this._cancelAllResizeFollowers({ resetScale: true });
         this._animatingWindows.clear();
         this._animatingTargets.clear();
         this._checkAllAnimationsComplete();

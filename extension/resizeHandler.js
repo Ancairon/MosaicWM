@@ -5,13 +5,14 @@
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import * as Logger from './logger.js';
-import { monotonicNow } from './timing.js';
+import { beforeRedraw, monotonicNow } from './timing.js';
 import * as WindowState from './windowState.js';
 import * as constants from './constants.js';
 import { TileZone } from './constants.js';
 import { isResizeGrabOp } from './grabOps.js';
-import { isWindowAlive } from './liveness.js';
+import { isWorkspaceAlive, isWindowAlive } from './liveness.js';
 import { MosaicModel } from './mosaicModel.js';
+import { MosaicConstraints } from './mosaicConstraint.js';
 
 import GObject from 'gi://GObject';
 
@@ -29,6 +30,11 @@ export const ResizeHandler = GObject.registerClass({
         this._resizeDebounceTimeout = null;
         this._lastResizeWindow = null;
         this._lastResizeTime = 0;
+        this._lastTileTime = 0;
+        this._manualResizeWindowId = null;
+        this._pendingResizeTick = null;
+        this._resizeTickCancel = null;
+        this._queueDeferredRetiles = [];
         // Keyboard resize: window ID while a keyboard-driven resize settle is in flight.
         // Prevents onSizeChanged from firing null-reference retiles during the settle window.
         this._keyboardResizingWindowId = null;
@@ -63,7 +69,8 @@ export const ResizeHandler = GObject.registerClass({
         this._timeoutRegistry.addIdle(() => {
             this._constraintRebalanceQueued = false;
             if (workspace && workspace.index() >= 0) {
-                this.tilingManager.rebalanceSmartResize(workspace, monitor);
+                this.tilingManager.measureEvent('clamp', () =>
+                    this.tilingManager.retileWithAllocation(workspace, monitor, null, { keepOversized: true }));
             }
             return GLib.SOURCE_REMOVE;
         }, 'resizeHandler_constraintRebalance');
@@ -82,7 +89,7 @@ export const ResizeHandler = GObject.registerClass({
         if (rect.width > pendingSmartSize.width + 2) WindowState.set(window, 'actualMinWidth', rect.width);
         if (rect.height > pendingSmartSize.height + 2) WindowState.set(window, 'actualMinHeight', rect.height);
         this.tilingManager.raisePreferredSizeToMinimum(window);
-        this._disarmClampVerification(window);
+        this.disarmClampVerification(window);
 
         // A window we just placed can clamp a few px against its own minimum.
         // Rebalancing right away races the tiling pass that's still settling
@@ -121,8 +128,8 @@ export const ResizeHandler = GObject.registerClass({
 
     // Only the tiler sends geometry; a silent client gets its frame committed
     // as truth once the over-target signals go quiet.
-    _armClampVerification(window, pendingSmartSize) {
-        this._disarmClampVerification(window);
+    armClampVerification(window, pendingSmartSize) {
+        this.disarmClampVerification(window);
 
         const verifyId = this._timeoutRegistry.add(constants.RESIZE_CLAMP_VERIFY_DELAY_MS, () => {
             WindowState.remove(window, 'clampVerifyId');
@@ -135,7 +142,7 @@ export const ResizeHandler = GObject.registerClass({
 
             const rect = window.get_frame_rect();
             if (this._clientStillCatchingUp(window, rect)) {
-                this._armClampVerification(window, pendingSmartSize);
+                this.armClampVerification(window, pendingSmartSize);
                 return GLib.SOURCE_REMOVE;
             }
             if (rect.width > pendingSmartSize.width + 2 || rect.height > pendingSmartSize.height + 2) {
@@ -149,7 +156,7 @@ export const ResizeHandler = GObject.registerClass({
         WindowState.set(window, 'clampVerifyId', verifyId);
     }
 
-    _disarmClampVerification(window) {
+    disarmClampVerification(window) {
         const verifyId = WindowState.get(window, 'clampVerifyId');
         if (verifyId === undefined) return;
         this._timeoutRegistry.remove(verifyId);
@@ -158,7 +165,7 @@ export const ResizeHandler = GObject.registerClass({
 
     onResizeBegin(window, grabpo) {
         this._resizeInOverflow = false;
-        this._lastResizeTileTime = 0;
+        this._manualResizeWindowId = window.get_id();
         this.tilingManager.isResizing = true;
         this.animationsManager.setResizingWindow(window.get_id());
         // Null grabpo = keyboard resize. Suppress onSizeChanged retiles until onResizeEnd.
@@ -167,10 +174,6 @@ export const ResizeHandler = GObject.registerClass({
         // Always clear pending resize targets so manual resize takes precedence
         WindowState.set(window, 'targetSmartResizeSize', null);
         WindowState.remove(window, 'targetRestoredSize');
-        if (WindowState.get(window, 'isSmartResizing')) {
-            Logger.log(`Manual resize started for ${window.get_id()} - clearing smart-resize state`);
-            WindowState.set(window, 'isSmartResizing', false);
-        }
 
         Logger.log(`Tracking resize for window ${window.get_id()}, grabpo=${grabpo}`);
     }
@@ -179,6 +182,11 @@ export const ResizeHandler = GObject.registerClass({
         // Keep resizingWindowId set during final retile to prevent animation jiggle
         this._keyboardResizingWindowId = null;
         Logger.log(`Resize ended for window ${window.get_id()}`);
+
+        this._manualResizeWindowId = null;
+        // The final retile below supersedes any tick still queued; one firing after
+        // an overflow move would tile a workspace the window already left.
+        this._cancelResizeTick();
 
         // Clear before the final retile, same as disableDragMode ahead of a drop's retile: the
         // grab is over, so this pass is allowed to commit a real eviction.
@@ -389,13 +397,23 @@ export const ResizeHandler = GObject.registerClass({
         if (!this.windowingManager.isRelated(window)) return true;
         // Windows pending in the evaluation queue haven't been processed yet, so ignore size changes
         if (WindowState.get(window, 'pendingInQueue')) return true;
-        if (rect.width <= constants.ANIMATION_DIFF_THRESHOLD || rect.height <= constants.ANIMATION_DIFF_THRESHOLD) return true;
-
-        if (WindowState.get(window, 'isSmartResizing') || WindowState.get(window, 'isReverseSmartResizing')) {
-            Logger.log(`[GUARD-BLOCK] onSizeChanged short-circuited for ${window.get_id()} - isSmartResizing=${WindowState.get(window, 'isSmartResizing')} isReverseSmartResizing=${WindowState.get(window, 'isReverseSmartResizing')}`);
-            this._sizeChanged = false;
+        // A thumbnail's frame can still land a resize that was in flight when it shrank. Its new
+        // proportions no longer match the slot the layout reserved, so the mosaic lays out again
+        // or the desktop and the overview disagree on its size.
+        if (WindowState.get(window, WindowState.IS_MINIATURE)) {
+            const workspace = window.get_workspace();
+            if (this._ext.miniatureManager?.refitToFrame(window) && workspace) {
+                this._sizeChanged = true;
+                try {
+                    this.tilingManager.retileWithAllocation(workspace, window.get_monitor(), null, { keepOversized: true });
+                } finally {
+                    this._sizeChanged = false;
+                }
+            }
             return true;
         }
+        if (rect.width <= constants.ANIMATION_DIFF_THRESHOLD || rect.height <= constants.ANIMATION_DIFF_THRESHOLD) return true;
+
         return false;
     }
 
@@ -411,7 +429,7 @@ export const ResizeHandler = GObject.registerClass({
                 // A young client often acks a beat late, so this frame is stale
                 // rather than a real minimum; the verification settles it.
                 Logger.log(`[SMART RESIZE] Window ${window.get_id()} above target while settling: target=${pendingSmartSize.width}×${pendingSmartSize.height}, actual=${rect.width}×${rect.height}; deferring to verification`);
-                this._armClampVerification(window, pendingSmartSize);
+                this.armClampVerification(window, pendingSmartSize);
                 this._sizeChanged = false;
                 return true;
             }
@@ -426,7 +444,7 @@ export const ResizeHandler = GObject.registerClass({
                 WindowState.remove(window, 'actualMinHeight');
             }
             WindowState.set(window, 'targetSmartResizeSize', null);
-            this._disarmClampVerification(window);
+            this.disarmClampVerification(window);
         }
 
         this._sizeChanged = false;
@@ -463,10 +481,12 @@ export const ResizeHandler = GObject.registerClass({
         return { isConstrained, userForcedResize, isMonitorSized, isEaseEcho, clientOwnedSize };
     }
 
-    // Manual grab, or a constrained window whose frame drifted far from its Smart Resize
-    // target (an ambient/client-side resize), both count as the user forcing the size.
+    // The grabbed window's manual drag, or a constrained window whose frame drifted
+    // far from its Smart Resize target (ambient/client-side), counts as the user
+    // forcing the size; siblings under an active grab only echo our own commits.
     _detectUserForcedResize(window, rect, isConstrained) {
-        if (this._currentGrabOp && isResizeGrabOp(this._currentGrabOp)) return true;
+        if (this._currentGrabOp && isResizeGrabOp(this._currentGrabOp) &&
+            this._manualResizeWindowId === window.get_id()) return true;
         if (!isConstrained) return false;
 
         const target = WindowState.get(window, 'targetSmartResizeSize');
@@ -492,15 +512,18 @@ export const ResizeHandler = GObject.registerClass({
     }
 
     // An ease echoes back the size the layout picked, which says nothing about what the window
-    // wants. Anything else arriving mid-ease is the client's own size. No target means no echo.
+    // wants. No target means no echo. Ownership is checked against our own commits instead,
+    // since plenty of paths raise isMosaicResizing with no target to compare against.
     _classifyEase(window, rect) {
-        const easeTarget = WindowState.get(window, 'isMosaicResizing')
+        const isMosaicResizing = WindowState.get(window, 'isMosaicResizing');
+        const easeTarget = isMosaicResizing
             ? this.animationsManager.getAnimatingTarget(window.get_id())
             : null;
         const isEaseEcho = !!easeTarget &&
             Math.abs(rect.width - easeTarget.width) <= constants.EASE_TARGET_TOLERANCE_PX &&
             Math.abs(rect.height - easeTarget.height) <= constants.EASE_TARGET_TOLERANCE_PX;
-        return { isEaseEcho, clientOwnedSize: !!easeTarget && !isEaseEcho };
+        const clientOwnedSize = !!isMosaicResizing && !MosaicConstraints.isOwnRequest(window, rect);
+        return { isEaseEcho, clientOwnedSize };
     }
 
     _updatePreferredSizeFromResize(window, rect, { isConstrained, userForcedResize, isMonitorSized, clientOwnedSize }) {
@@ -589,6 +612,14 @@ export const ResizeHandler = GObject.registerClass({
         return !!(tileState && tileState.zone !== TileZone.NONE);
     }
 
+    // A sibling resizing during a grab is echoing the region this handler itself
+    // committed; reacting would feed our own acks back in as new retiles. The next
+    // tick, or the release retile, reads the sibling's live frame anyway.
+    _isGrabSiblingEcho(windowId) {
+        if (!this._currentGrabOp || !isResizeGrabOp(this._currentGrabOp)) return false;
+        return this._manualResizeWindowId !== null && windowId !== this._manualResizeWindowId;
+    }
+
     // The latch (_sizeChanged) blocks re-entry while our own tileWorkspaceWindows below
     // fires more size-changes; every exit clears it.
     _retileAfterSizeChange(window) {
@@ -602,8 +633,13 @@ export const ResizeHandler = GObject.registerClass({
         }
 
         if (!this.windowingManager.isMaximizedOrFullscreen(window)) {
-            const isManualResize = this._currentGrabOp && isResizeGrabOp(this._currentGrabOp);
             const windowId = window.get_id();
+            if (this._isGrabSiblingEcho(windowId)) {
+                this._sizeChanged = false;
+                return;
+            }
+
+            const isManualResize = this._currentGrabOp && isResizeGrabOp(this._currentGrabOp);
             const resizeNow = monotonicNow();
             const isActiveResize = isManualResize ||
                 (this._lastResizeWindow === windowId && (resizeNow - this._lastResizeTime) < constants.RESIZE_SETTLE_DELAY_MS * 2);
@@ -611,31 +647,50 @@ export const ResizeHandler = GObject.registerClass({
             this._lastResizeTime = resizeNow;
 
             if (isActiveResize) {
-                this._retileDuringActiveResize(window, workspace, monitor, resizeNow);
+                this._scheduleResizeTick(window, workspace, monitor);
                 this._sizeChanged = false;
                 return;
             }
 
-            if (this._retileAfterSettledResize(window, workspace, monitor)) return;
+            if (this.tilingManager.measureEvent('resize-settle', () => this._retileAfterSettledResize(window, workspace, monitor))) return;
         }
 
-        this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
+        this.tilingManager.measureEvent('resize-settle', () => this.tilingManager.retileWithAllocation(workspace, monitor, null, { keepOversized: true }));
         this._sizeChanged = false;
     }
 
-    _retileDuringActiveResize(window, workspace, monitor, resizeNow) {
-        // Throttle: execute immediately, skip if too soon since last retile
-        if (this._lastResizeTileTime && (resizeNow - this._lastResizeTileTime) < 16) {
-            return;
-        }
-        this._lastResizeTileTime = resizeNow;
+    // One retile per frame: every size-changed landing before the next repaint collapses
+    // into a single tick, the cadence Mutter's own drag resizes with. A tick already
+    // pending reads live frames, so a newer event must not replace the latched window.
+    _scheduleResizeTick(window, workspace, monitor) {
+        if (this._resizeTickCancel) return;
+        this._pendingResizeTick = { window, workspace, monitor };
+        this._resizeTickCancel = beforeRedraw(() => {
+            this._resizeTickCancel = null;
+            const pending = this._pendingResizeTick;
+            this._pendingResizeTick = null;
+            if (!pending || !isWindowAlive(pending.window) || !isWorkspaceAlive(pending.workspace)) return;
+            this.tilingManager.measureEvent('resize-tick', () =>
+                this._retileDuringActiveResize(pending.window, pending.workspace, pending.monitor));
+        });
+    }
 
+    _cancelResizeTick() {
+        this._pendingResizeTick = null;
+        if (this._resizeTickCancel) {
+            this._resizeTickCancel();
+            this._resizeTickCancel = null;
+        }
+    }
+
+    _retileDuringActiveResize(window, workspace, monitor) {
         if (this._resizeDebounceTimeout) {
             this._timeoutRegistry.remove(this._resizeDebounceTimeout);
             this._resizeDebounceTimeout = null;
         }
 
-        const canFit = this.tilingManager.canFitWindow(window, workspace, monitor);
+        // Fits means fits once everyone else gives way along their own axis, not at today's sizes.
+        const canFit = !this.tilingManager.retileWithAllocation(workspace, monitor, null, { dryRun: true }).overflow;
         const mosaicWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
             .filter(w => !this.edgeTilingManager.isEdgeTiled(w) && !this.windowingManager.isExcluded(w));
         const isSolo = mosaicWindows.length <= 1;
@@ -658,7 +713,6 @@ export const ResizeHandler = GObject.registerClass({
             return;
         }
 
-        // GHOST MODE: Reduce opacity to signal that the window no longer fits.
         this._resizeInOverflow = true;
         this._resizeOverflowWindow = window;
         const actor = window.get_compositor_private();
@@ -674,21 +728,23 @@ export const ResizeHandler = GObject.registerClass({
         }
 
         this._retileResizeSiblings(workspace, window, monitor);
-
-        // Shrinking the dragged window can free up room for a sibling
-        // miniature mid-drag. The overflow path only checks the inverse.
-        if (!this._resizeInOverflow && this._ext.windowHandler) {
-            this._ext.windowHandler._tryAutoRestoreMiniature(mosaicWindows, workspace, monitor);
-        }
     }
 
     // Returns true when it fully handled the event (caller must stop); false to fall through
     // to the final catch-all retile.
     _retileAfterSettledResize(window, workspace, monitor) {
-        const canFit = this.tilingManager.canFitWindow(window, workspace, monitor);
+        const canFit = !this.tilingManager.retileWithAllocation(workspace, monitor, null, { dryRun: true }).overflow;
         const now = monotonicNow();
 
         if (this._settledResizeShouldSkip(window, now)) {
+            this._sizeChanged = false;
+            return true;
+        }
+
+        // The queue's pass already drew with the size it read on arrival and won't look again,
+        // so a client growing in the meantime has to be laid out once the queue is done.
+        if (this._ext.windowHandler?.isEvaluatingQueue) {
+            this._deferUntilQueueDrains(workspace, monitor);
             this._sizeChanged = false;
             return true;
         }
@@ -698,7 +754,7 @@ export const ResizeHandler = GObject.registerClass({
         }
 
         // Throttle to avoid excessive calculations during smooth resizing
-        if (canFit && this._lastTileTime && (now - this._lastTileTime < 30)) {
+        if (canFit && this._lastTileTime && (now - this._lastTileTime < constants.RESIZE_SETTLE_TILE_THROTTLE_MS)) {
             this._sizeChanged = false;
             return true;
         }
@@ -726,16 +782,13 @@ export const ResizeHandler = GObject.registerClass({
     }
 
     // Reasons a settled-resize retile is a no-op: still in the reverse-resize grace window,
-    // a smart resize owns the geometry, the arrival queue or a drag is already tiling, or an
+    // a smart resize owns the geometry, a drag is already tiling, or an
     // edge-tile exit is restoring full size into a tight mosaic (must miniaturize, not eject).
     _settledResizeShouldSkip(window, now) {
         if (this._resizeGracePeriod && (now - this._resizeGracePeriod) < constants.REVERSE_RESIZE_PROTECTION_MS) {
             return true;
         }
-        if (WindowState.get(window, 'isSmartResizing') || this.tilingManager._isSmartResizingBlocked) {
-            return true;
-        }
-        if (this._ext.windowHandler && this._ext.windowHandler.isEvaluatingQueue) {
+        if (this.tilingManager._isSmartResizingBlocked) {
             return true;
         }
         if (this.tilingManager.isDragging) {
@@ -745,6 +798,26 @@ export const ResizeHandler = GObject.registerClass({
             return true;
         }
         return false;
+    }
+
+    _deferUntilQueueDrains(workspace, monitor) {
+        if (this._queueDeferredRetiles.some(d => d.workspace === workspace && d.monitor === monitor)) return;
+        this._queueDeferredRetiles.push({ workspace, monitor });
+    }
+
+    flushQueueDeferredRetiles() {
+        const deferred = this._queueDeferredRetiles;
+        this._queueDeferredRetiles = [];
+        for (const { workspace, monitor } of deferred) {
+            if (!isWorkspaceAlive(workspace)) continue;
+            this._sizeChanged = true;
+            try {
+                this.tilingManager.measureEvent('resize-settle', () =>
+                    this.tilingManager.retileWithAllocation(workspace, monitor, null, { keepOversized: true }));
+            } finally {
+                this._sizeChanged = false;
+            }
+        }
     }
 
     // The drag flag and the edge-tiling stamp both mean the same thing here, just raised by
@@ -788,13 +861,16 @@ export const ResizeHandler = GObject.registerClass({
             this._timeoutRegistry.remove(this._resizeDebounceTimeout);
             this._resizeDebounceTimeout = null;
         }
+        this._cancelResizeTick();
+        this._queueDeferredRetiles = [];
+        this._manualResizeWindowId = null;
         this._resizeInOverflow = false;
         this._resizeOverflowWindow = null;
         this._sizeChanged = false;
         this._resizeGracePeriod = null;
         this._lastResizeWindow = null;
         this._lastResizeTime = 0;
-        this._lastResizeTileTime = 0;
+        this._lastTileTime = 0;
         this._keyboardResizingWindowId = null;
         this._constraintRebalanceQueued = false;
         this._constraintRebalanceCount = 0;

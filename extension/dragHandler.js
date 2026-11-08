@@ -307,6 +307,12 @@ export const DragHandler = GObject.registerClass({
     }
 
     _dropByTiling(window, workArea) {
+        if (!this.edgeTilingManager.zoneFits(window, this._currentZone, workArea)) {
+            Logger.log(`DnD: zone ${this._currentZone} refused, the window cannot live in it`);
+            this._abandonDrop();
+            return;
+        }
+
         Logger.log(`DnD: zone ${this._currentZone} empty, applying tile`);
 
         this._skipNextTiling = window.get_id();
@@ -318,16 +324,22 @@ export const DragHandler = GObject.registerClass({
             // The preview's miniatures are the real thing already, so the tile just keeps them.
             Logger.log(`Edge tile confirmed - keeping ${this._previewMiniaturizedWindows.length} miniatures`);
             this._previewMiniaturizedWindows = [];
+            this.tilingManager.pinEdgePreview(window.get_workspace());
 
             this._timeoutRegistry.add(constants.RETILE_DELAY_MS, () => {
                 this._skipNextTiling = null;
                 return GLib.SOURCE_REMOVE;
             }, 'dragHandler_skipTilingApply');
         } else {
-            this.clearGhostWindows();
-            this._restorePreviewMiniatures();
-            this._skipNextTiling = null;
+            this._abandonDrop();
         }
+    }
+
+    // The window keeps whatever the mosaic had for it, which is where it came from.
+    _abandonDrop() {
+        this.clearGhostWindows();
+        this._restorePreviewMiniatures();
+        this._skipNextTiling = null;
     }
 
     _finishMoveDragCleanup() {
@@ -358,7 +370,9 @@ export const DragHandler = GObject.registerClass({
         // Resize-end retiling is handled by resizeHandler.onResizeEnd below, which
         // keeps resizingWindowId set through the final retile to avoid animation
         // jiggle. Skip stopDrag's own retile here to avoid two overlapping tiling passes.
-        this.reorderingManager.stopDrag(window, false, skipTiling || isResizeEnd);
+        // An edge drop already pinned what its preview showed; the reorder's own layout still
+        // counts the window that just left for the tile.
+        this.reorderingManager.stopDrag(window, skipTiling && !isResizeEnd, skipTiling || isResizeEnd);
 
         if (isResizeEnd) {
             this._ext.resizeHandler.onResizeEnd(window, grabpo, skipTiling);
@@ -382,16 +396,7 @@ export const DragHandler = GObject.registerClass({
                 if (sourceMonitor !== undefined && sourceMonitor !== monitor) {
                     WindowState.remove(window, 'leftMonitor');
 
-                    // A plain retile never un-miniaturizes; try restoring the source's
-                    // miniatures first, same as onWindowLeftMonitor does outside a drag.
-                    const sourceRemaining = this.windowingManager.getMonitorWorkspaceWindows(workspace, sourceMonitor)
-                        .filter(w => w.get_id() !== window.get_id() &&
-                                     !this.edgeTilingManager.isEdgeTiled(w) &&
-                                     !this.windowingManager.isExcluded(w));
-                    const restored = this._ext.windowHandler?._tryAutoRestoreMiniature(sourceRemaining, workspace, sourceMonitor);
-                    if (!restored) {
-                        this.tilingManager.tileWorkspaceWindows(workspace, null, sourceMonitor, false);
-                    }
+                    this.tilingManager.retileWithAllocation(workspace, sourceMonitor);
                 }
             }, this._timeoutRegistry);
         }
@@ -451,7 +456,7 @@ export const DragHandler = GObject.registerClass({
         }
         this._lastReorderMonitor = monitor;
         this.edgeTilingManager.setEdgeTilingActive(true, this._draggedWindow);
-        this.drawingManager.showTilePreview(zone, workArea, this._draggedWindow);
+        this._refreshZonePreview(zone, workArea);
 
         const remainingSpace = this.edgeTilingManager.calculateRemainingSpaceForZone(zone, workArea);
         this.tilingManager.setDragRemainingSpace(remainingSpace);
@@ -479,6 +484,18 @@ export const DragHandler = GObject.registerClass({
             Logger.log(`Edge tiling: previewing ${mosaicWindows[0].get_id()} as opposite half ${remainingSpace.width}x${remainingSpace.height}`);
             this.drawingManager.showCompanionTilePreview(remainingSpace);
         }
+
+    }
+
+    // The square just says which half it takes; whether the window can actually live there is a
+    // separate question, and a shake is how a no gets said before the drop.
+    _refreshZonePreview(zone, workArea) {
+        this.drawingManager.showTilePreview(zone, workArea, this._draggedWindow);
+
+        if (this.edgeTilingManager.zoneFits(this._draggedWindow, zone, workArea)) return;
+
+        Logger.log(`Edge tiling: zone ${zone} cannot hold the dragged window`);
+        this.animationsManager?.shakeRefusal(this.drawingManager.getTilePreviewActor());
     }
 
     _exitEdgeZone(workspace, monitor) {

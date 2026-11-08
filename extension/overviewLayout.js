@@ -155,7 +155,9 @@ export class MosaicLayoutStrategy extends Workspace.LayoutStrategy {
             const rect = isSacred
                 ? mw.get_frame_rect()
                 : (ComputedLayouts.get(mw) || mw.get_frame_rect());
-            if (!rect) continue;
+            // A window still mapping has no computed region and a 0x0 frame, which the gap
+            // subtraction below would turn into a negative size. The next pass republishes it.
+            if (!rect || rect.width <= 0 || rect.height <= 0) continue;
 
             // Formula: (DesktopPos - DesktopOrigin) * Scale + OverviewSlotOrigin + CenteringOffset
             // Then shrink the mirrored thumbnail slightly and resolve collisions so
