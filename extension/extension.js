@@ -948,13 +948,28 @@ export default class WindowMosaicExtension extends Extension {
         const isEdgeTiled = this.edgeTilingManager.isEdgeTiled(window);
         const workArea = isEdgeTiled
             ? workspace.get_work_area_for_monitor(monitor)
-            : this.tilingManager.getUsableWorkArea(workspace, monitor);
+            : this._keyboardResizeMosaicArea(workspace, monitor);
         if (!workArea || workArea.width <= 0 || workArea.height <= 0) {
             Logger.log(`Keyboard edge resize ${edge} for ${window.get_id()} has no usable work area`);
             return null;
         }
 
         return workArea;
+    }
+
+    // The space the mosaic owns: what edge tiles leave over, or nothing once both sides are
+    // tiled. Upstream dropped TilingManager.getUsableWorkArea with the allocator rework, so
+    // its semantics live here, next to the only caller.
+    _keyboardResizeMosaicArea(workspace, monitor) {
+        const edgeTiled = this.edgeTilingManager.getEdgeTiledWindows(workspace, monitor);
+        if (edgeTiled.length === 0)
+            return this.tilingManager._clampedWorkArea(workspace, monitor);
+
+        const sides = new Set(edgeTiled.map(s => constants.ZONE_SIDE[s.zone]));
+        if (sides.has('left') && sides.has('right'))
+            return null;
+
+        return this.edgeTilingManager.calculateRemainingSpace(workspace, monitor);
     }
 
     // Cycles the requested edge through the RESIZE_CYCLE_FRACTIONS presets, wrapping at
